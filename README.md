@@ -8,4 +8,7 @@ The relevant window is selected by testing the supplied regex against window tit
 ```
 kwriteconfig5 --file ~/.config/kwinrc --group Script-quakewindows --key WindowName1 <window title regex>
 ```
+
 Disable-Enable the script inside KWin settings after changing the configuration.
+
+The script is inspired by [kwin-toggle-window](https://www.opencode.net/arnek01/kwin-toggle-window) by Arne Keller.
