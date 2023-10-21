@@ -19,7 +19,7 @@ function toggleWindow(index) {
    for (var i = 0; i < allClients.length; ++i) {
       if (isRelevant(allClients[i], index)) {
          var prevMini = allClients[i].minimized;
-         allClients[i].onAllDesktops = prevMini;
+         allClients[i].onAllDesktops = true;
          allClients[i].minimized = !prevMini;
          allClients[i].skipTaskbar = !prevMini;
          allClients[i].skipPager = !prevMini;
