@@ -1,12 +1,13 @@
 # kwin-quake-windows
 
-Simple script to toggle the visibility of a window by (un-)minimizing and hiding it from the task panel, pager and application switcher when minimized. It allows you to have the quick access to running applications that you must review frequently during the day. For example, I use the script with the file manager, task list, e-mail client and chat windows.  
-The script can handle up to 7 different windows.
+Make any window behave like a quake-style terminal! Enables window show/hide by hotkey. Can handle up to 7 different windows. Window title is used to recognize windows. Regex supported.
 
-The relevant window is selected by testing the supplied regex against window titles. The regex could be specified by the command like:
-
+Define windows' titles to handle like that:
 ```
-kwriteconfig5 --file ~/.config/kwinrc --group Script-quakewindows --key WindowName1 <window title regex>
+kwriteconfig5 --file ~/.config/kwinrc --group Script-quakewindows --key WindowName1 <window title regex for the first hotkey>
+kwriteconfig5 --file ~/.config/kwinrc --group Script-quakewindows --key WindowName2 <window title regex for the second hotkey>
+…
+kwriteconfig5 --file ~/.config/kwinrc --group Script-quakewindows --key WindowName7 <window title regex for the seventh hotkey>
 ```
 
 Disable-Enable the script inside KWin settings after changing the configuration.
