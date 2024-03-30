@@ -1,0 +1,19 @@
+{
+    "KPackageStructure": "KWin/Script",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "angrycore@gmail.com",
+                "Name": "Ivan Volkov"
+            }
+        ],
+        "Description": "Make any window behave like a quake-style terminal!",
+        "Icon": "preferences-system-windows-move",
+        "Id": "quakewindows",
+        "License": "GPL",
+        "Name": "Quake Windows",
+        "Version": "2.0",
+        "EnabledByDefault": true
+    },
+    "X-Plasma-API": "javascript"
+}
