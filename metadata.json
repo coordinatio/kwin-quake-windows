@@ -12,7 +12,7 @@
         "Id": "quakewindows",
         "License": "GPL",
         "Name": "Quake Windows",
-        "Version": "2.0",
+        "Version": "2.1",
         "EnabledByDefault": true
     },
     "X-Plasma-API": "javascript"

@@ -32,12 +32,25 @@ function toggleWindow(index) {
    }
 }
 
+function onCurrentDesktopChanged(oldDesktop, movingClient) {
+   //That is the workaround for the bug which makes the hidden windows reappear on the taskbar on desktop change
+   var allClients = workspace.windowList();
+   for (var i = 0; i < allClients.length; ++i) {
+      for (var index = 0; index < windowName.length; ++index) {
+         if (isRelevant(allClients[i], index)) {
+            allClients[i].skipTaskbar = allClients[i].minimized;
+         }
+      }
+   }
+}
+
 function init() {
    for (let i = 0; i < windowName.length; ++i) {
       // kwriteconfig6 --file ~/.config/kwinrc --group Script-quakewindows --key WindowName1 <window title regex>
       windowName[i] = new RegExp(readConfig(`WindowName${i+1}`, "Alacritty").toString());
       registerShortcut(`QuakeWindows ${i+1}`, `Toggle Window ${i+1}`, "", function () {toggleWindow(i)});
    }
+   workspace.currentDesktopChanged.connect(onCurrentDesktopChanged);
    options.configChanged.connect(init);
 }
 
