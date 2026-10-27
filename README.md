@@ -59,32 +59,34 @@ Press **Apply** or **OK**. Closing the Configure dialog only returns focus to Sy
 which is itself a settings window, so the script cannot treat that as "the dialog is gone":
 the new values are applied once System Settings itself loses focus, or on the next hotkey
 press. There is no need to disable and re-enable the script, and a hotkey pressed in between
-is not lost — it waits for the new values, normally about 200 ms after KWin confirms the
-reconfigure. If KWin never confirms, the deferred press is replayed about 1 s after the most
-recent deferred press, so several quick presses can stretch the wait.
+is not lost — it waits for the new values, which are readable as soon as KWin answers the
+reload request (milliseconds after it is sent). If KWin does not answer, the script falls
+back to a plain reconfigure about 1 s after the most recent deferred press and replays the
+press about 1 s after that, so several quick presses can stretch the wait to about 2 s.
 
 If the change does not arrive (for instance after editing `kwinrc` by hand), toggle the
 script off and on again in *KWin Scripts*.
 
 ### How configuration reloading works
 
-Why KWin has to be asked: `kwinrc` is only re-read when KWin reconfigures itself, and the
-generic scripted configuration module writes the script's group without notifying KWin
-afterwards (upstream TODO). Scripts get no signal about their own configuration either, so
-the script infers it from window focus.
-
-A possible future optimisation is a script restart that reports its completion
-(`Scripting.start`): the script could then re-read its configuration once instead of
-inferring the reload from focus. Today that call only re-parses the script and reports
-nothing, so the inference above is what is left.
+Why KWin has to be asked: `kwinrc` is only re-read when KWin reconfigures itself or when its
+scripting interface is asked to reload, and the generic scripted configuration module writes
+the script's group without notifying KWin afterwards (upstream TODO). Scripts get no signal
+about their own configuration either, so the script infers *when* to reload from window focus,
+and then asks KWin to re-read the file through its scripting interface.
 
 * **On focus loss.** Activating a settings window sets a latch; activating a non-settings
-  window with the latch set asks KWin to reconfigure through D-Bus
-  (`org.kde.KWin.reconfigure`). KWin then emits `options.configChanged`, which is the moment
-  `readConfig()` starts returning the new values. KWin coalesces reconfigure requests with
-  its own ~200 ms timer, so the script does not debounce on its own; it only ignores a new
-  request while the previous one is still unanswered, which means presses spaced further
-  apart each cost one reconfigure pass.
+  window with the latch set asks KWin to re-read `kwinrc` by calling
+  `org.kde.kwin.Scripting.start` on `/Scripting`. KWin reparses the file synchronously inside
+  that call, so its reply is a deterministic "the configuration is fresh now" moment instead
+  of something the script has to infer from a timeout. It is also the cheap call: it does not
+  re-evaluate the window rules of every window the way `org.kde.KWin.reconfigure`
+  (`Workspace::slotReconfigure()`) does, and it does not restart this script — KWin's
+  `Script::run()` returns immediately for a script that is already running, so only the
+  already loaded script list is refreshed.
+* **On the reply.** The callback of that call re-reads the seven slots, stops the deadline
+  and replays the presses that were waiting for the new values. Nothing else is needed: the
+  reply means the file has been re-read.
 * **On a press.** If the configuration may be stale — a reload was requested and not
   confirmed, the dialog was activated since the last reload, or the dialog is focused right
   now — the press is not carried out. Its slot is remembered as an odd/even count (toggling
@@ -93,38 +95,46 @@ nothing, so the inference above is what is left.
   remembered that way.
 * **On a timeout.** A single 1000 ms deadline is armed by the reload request and re-armed by
   every deferred press, so it fires 1 s after the last of them rather than after the first.
-  When it fires, `awaitingConfig` is cleared (otherwise one unanswered request would ignore
-  all later ones forever, since `callDBus()` drops error replies), one line is written to the
-  journal, the configuration is re-read and the remembered presses are replayed. A press is
-  therefore never lost because KWin stayed silent.
-* **On `options.configChanged`.** Any such signal counts, whichever reconfigure caused it:
-  KWin reparses its configuration before emitting it, so the values are already fresh. The
-  script recompiles the slots, stops the deadline and replays the remembered presses in
-  slot order.
+  It has two stages, one per request. When it fires without a reply — for instance on a KWin
+  that does not know the scripting method: `Script::callDBus()` drops the error reply and
+  never calls the callback — the script falls back once to `org.kde.KWin.reconfigure`, which
+  works on every KWin, writes one journal line, and re-arms the deadline so that the
+  reconfigure's own answer has a chance to arrive. When the second deadline also expires,
+  `awaitingConfig` is cleared (otherwise one unanswered request would ignore all later ones
+  forever), one more line is written, the configuration is re-read and the remembered presses
+  are replayed. A press is therefore never lost because KWin stayed silent.
+* **On `options.configChanged`.** Any such signal counts too, whichever reconfigure caused it
+  (a KCM applying a KWin setting, for example): KWin reparses its configuration before
+  emitting it, so the values are already fresh. It runs the same handler as the reply, which
+  is idempotent — an unchanged configuration signature makes the re-read a no-op, and the
+  press queue is emptied before it is replayed — so a reply and a `configChanged` for the same
+  reload replay the presses exactly once.
 
 Known trade-offs:
 
 * A press that arrives before Apply is replayed against the configuration as it was before
   that Apply — *usually*, because this is a race, not a guarantee: it holds when the press
-  was deferred before KWin's reparse finished. If Apply lands first and KWin's ~200 ms
-  reparse completes before the deferred press is replayed, that press is replayed against the
-  new values instead. The next press always uses the new expression.
+  was deferred before KWin's reparse finished. If Apply lands first and the reload completes
+  before the deferred press is replayed, that press is replayed against the new values
+  instead. The next press always uses the new expression.
 * A replay that activates a normal window clears the "dialog was used" latch, because the
   activation looks exactly like focus leaving the dialog. So if the Configure dialog is still
   open, the next press can use the values from before the dialog's *next* Apply instead of
   being deferred. The Apply click refocuses the dialog and re-arms the latch, so this heals
   itself and costs at most one press.
-* Leaving System Settings triggers one KWin reconfigure even from an unrelated page, and so
-  does closing `kcmshell6`: the script cannot tell which configuration module was open. That
-  is the price of the generic module not notifying KWin after writing `kwinrc`.
+* Leaving System Settings asks for one configuration reload even from an unrelated page, and
+  so does closing `kcmshell6`: the script cannot tell which configuration module was open.
+  That is the price of the generic module not notifying KWin after writing `kwinrc`. Only the
+  fallback path costs a full reconfigure, which also re-evaluates every window rule, and it
+  is coalesced by KWin's own ~200 ms timer.
 * Which windows count as settings windows is a name heuristic over the window class, the
   resource name and the desktop file name (the names ending in `settings` and the `kcmshell`
   modules). A third-party window whose name merely ends with `settings` is treated as one
-  too, which costs at most one deferred press and one extra reconfigure.
+  too, which costs at most one deferred press and one extra reload.
 * If no deadline can be armed — no `QTimer` can be created, or `start()` fails — a press
   with a possibly stale configuration is toggled synchronously instead of waiting forever.
-  The same fallback applies when the reconfigure request itself fails. That is reported
-  once in the journal, and a reload request is never latched without a deadline to end it.
+  The same fallback applies when the reload request itself fails. That is reported once in
+  the journal, and a reload request is never latched without a deadline to end it.
 * Holding a hotkey while a settings window is focused defers every auto-repeated press, and
   the parity model then decides the outcome: an odd number of presses toggles the slot once
   after the deadline, an even number toggles nothing at all. That is inherent to counting
@@ -224,10 +234,23 @@ is written outside its temporary directory.
 `tests/script-engine-test.cpp`, evaluates `contents/code/main.js` in a `QJSEngine` where
 `readConfig`, `registerShortcut`, `callDBus`, `console`, `workspace` and `options` are recording
 mocks and `QTimer` is the real Qt class KWin exposes, then presses the shortcuts, defers a press
-behind an active settings window, replays it through `options.configChanged` and waits for the
-actual timer to fire — asserting that the replay happens within about 1 s of the deferral. It
-needs `g++`, `pkg-config`, `qmake6` (to locate `moc`) and the Qt6 Core/Qml development files;
-when any of them is missing it explains that and exits 0.
+behind an active settings window, replays it through the reply of the scripting-interface
+request and through `options.configChanged`, and waits for the actual timer to fire — asserting
+that the silent-KWin fallback sends exactly one reconfigure and that the replay happens within
+two deadlines of the deferral. It needs `g++`, `pkg-config`, `qmake6` (to locate `moc`) and the
+Qt6 Core/Qml development files; when any of them is missing it explains that and exits 0.
+
+Both optional suites - the KCM check and the script engine check - skip with exit status 0 when
+their dependencies are missing. A CI job must not go green while that coverage silently
+disappears, so set `QUAKEWINDOWS_TEST_REQUIRE=1` to turn such a skip into a failure:
+
+```
+QUAKEWINDOWS_TEST_REQUIRE=1 ./tests/run-kcm-test.sh
+QUAKEWINDOWS_TEST_REQUIRE=1 ./tests/run-script-engine-test.sh
+```
+
+With the variable set, a missing dependency is reported as `FAIL` with exit status 1. The
+JavaScript, UI and locale suites have no optional parts and do not look at it.
 
 ## Credits
 

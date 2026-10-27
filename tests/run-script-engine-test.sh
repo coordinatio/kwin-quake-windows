@@ -4,9 +4,10 @@
 #
 # Builds tests/script-engine-test.cpp and evaluates the script in a QJSEngine
 # where QTimer is registered exactly like KWin registers it, and drives the seven
-# shortcuts, the deferral behind an active settings window, the replay through
-# options.configChanged and the real timer timeout. It is the only suite that can
-# prove the script uses nothing KWin does not expose.
+# shortcuts, the deferral behind an active settings window, the replay through the
+# scripting-interface reply and through options.configChanged, and the real timer
+# timeout with its reconfigure fallback. It is the only suite that can prove the
+# script uses nothing KWin does not expose.
 #
 # Everything - build tree and the meta-object code moc generates - lives in one
 # mktemp -d directory that is removed on exit. The repository and the user's
@@ -15,7 +16,9 @@
 #
 # The check is optional by design: without a C++20 compiler, pkg-config, qmake6,
 # moc or the Qt6 Core/Qml development files it explains what is missing and
-# exits 0. Nothing happens before that check, not even mktemp.
+# exits 0. QUAKEWINDOWS_TEST_REQUIRE=1 turns that skip into a failure, so a CI job
+# cannot go green while the coverage silently disappears. Nothing happens before
+# that check, not even mktemp.
 #
 # QUAKEWINDOWS_TEST_SCRIPT overrides the script under test, which is how the
 # suite is shown to fail on a deliberately broken copy.
@@ -79,6 +82,12 @@ if [ ${#missing[@]} -gt 0 ]; then
     echo "      On Arch/Plasma install: base-devel qt6-base qt6-declarative."
     echo "      The JavaScript, UI and locale suites do not need any of this."
     echo "      Nothing was built or run."
+    # A CI job must not go green while the coverage silently disappears.
+    if [ "${QUAKEWINDOWS_TEST_REQUIRE:-}" = "1" ]; then
+        echo "FAIL: QUAKEWINDOWS_TEST_REQUIRE=1 asks for this check, but it cannot" >&2
+        echo "      run here: install the dependencies listed above or unset the variable." >&2
+        exit 1
+    fi
     exit 0
 fi
 

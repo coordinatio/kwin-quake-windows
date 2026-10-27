@@ -13,7 +13,9 @@
 //     in a user session.
 //   * readConfig, callDBus and registerShortcut are properties of one object,
 //     copied onto the global object the way KWin copies the methods of the Script
-//     object, so they are global functions here too.
+//     object, so they are global functions here too. callDBus keeps the last
+//     callable argument as the reply callback, exactly like Script::callDBus(),
+//     so a scenario can deliver the reply of the scripting-interface request.
 //   * console, workspace and options are recording fakes with the same shape as
 //     KWin's: options emits configChanged, workspace has an activeWindow property,
 //     windowList() and the windowActivated/currentDesktopChanged signals.
@@ -233,9 +235,14 @@ public:
     }
 
     Q_INVOKABLE void callDBus(const QString &service, const QString &path,
-                              const QString &interface, const QString &method)
+                              const QString &interface, const QString &method,
+                              const QJSValue &argument = QJSValue())
     {
         dbusCalls.append(service + u' ' + path + u' ' + interface + u' ' + method);
+        // Script::callDBus() treats the last callable argument as the reply
+        // callback and drops it for an error reply; it is kept here so a scenario
+        // can answer the request the way KWin does.
+        lastReply = argument.isCallable() ? argument : QJSValue();
     }
 
     Q_INVOKABLE void registerShortcut(const QString &id, const QString &name,
@@ -265,8 +272,21 @@ public:
         return calls;
     }
 
+    int startCalls() const
+    {
+        int calls = 0;
+        for (const QString &call : dbusCalls) {
+            if (call.endsWith(QLatin1String(" org.kde.kwin.Scripting start"))) {
+                ++calls;
+            }
+        }
+        return calls;
+    }
+
     QList<Shortcut> shortcuts;
     QStringList dbusCalls;
+    // The reply callback of the newest request, cleared before it is called.
+    QJSValue lastReply;
 
 private:
     QHash<QString, QVariant> m_config;
@@ -318,6 +338,33 @@ public:
         return true;
     }
 
+    ~Harness()
+    {
+        // The callback belongs to the engine and must not outlive it.
+        host.lastReply = QJSValue();
+    }
+
+    // Delivers the reply of the newest scripting-interface request: KWin calls the
+    // callback with the arguments of the D-Bus reply, and Scripting::start()
+    // returns nothing, so it is called with none.
+    bool deliverReply()
+    {
+        if (!host.lastReply.isCallable()) {
+            return false;
+        }
+        const QJSValue reply = host.lastReply;
+        // Cleared first: a callback that asks for another reload must not be
+        // handed the same reply a second time.
+        host.lastReply = QJSValue();
+        const QJSValue result = reply.call();
+        if (result.isError()) {
+            stream() << "FAIL: the reply callback threw: "
+                     << result.property(QStringLiteral("message")).toString() << Qt::endl;
+            ++failures;
+        }
+        return true;
+    }
+
     QString warnings() const
     {
         return console.warnings.join(u'\n');
@@ -326,6 +373,11 @@ public:
     int reconfigureCalls() const
     {
         return host.reconfigureCalls();
+    }
+
+    int startCalls() const
+    {
+        return host.startCalls();
     }
 
     FakeHost host;
@@ -474,11 +526,11 @@ int main(int argc, char **argv)
         check(!terminal->minimized && !terminal->skipTaskbar,
               QStringLiteral("a second press restores the window"));
         check(harness.reconfigureCalls() == 0,
-              QStringLiteral("a fresh press never asks KWin to reconfigure (got %1)")
-                  .arg(harness.reconfigureCalls()));
+              QStringLiteral("a fresh press never asks KWin for a reload (got %1)")
+                  .arg(harness.reconfigureCalls() + harness.startCalls()));
     }
 
-    // ------------- 3. deferral behind a settings window, replay and press parity
+    // ---------------- 3. deferral behind a settings window, replay and presses
     {
         Harness harness;
         auto *settings = new FakeWindow(QStringLiteral("System Settings"),
@@ -495,8 +547,11 @@ int main(int argc, char **argv)
         press(harness, 0);
         check(!terminal->minimized,
               QStringLiteral("a press while a settings window is active is deferred, not toggled"));
-        check(harness.reconfigureCalls() == 1,
-              QStringLiteral("the deferred press asks KWin to reconfigure exactly once (got %1)")
+        check(harness.startCalls() == 1,
+              QStringLiteral("the deferred press makes exactly one scripting-interface request (got %1)")
+                  .arg(harness.startCalls()));
+        check(harness.reconfigureCalls() == 0,
+              QStringLiteral("and asks for no reconfigure while that request is unanswered (got %1)")
                   .arg(harness.reconfigureCalls()));
 
         // Apply: the fake kwinrc changes and KWin emits options.configChanged.
@@ -512,16 +567,60 @@ int main(int argc, char **argv)
         // The parity rule: the dialog is still focused (the latch survives the
         // reload), so two presses cancel out instead of toggling twice.
         const bool minimizedBefore = renamed->minimized;
-        const int callsBefore = harness.reconfigureCalls();
+        const int callsBefore = harness.startCalls();
         press(harness, 0);
         press(harness, 0);
-        check(harness.reconfigureCalls() == callsBefore + 1,
-              QStringLiteral("two deferred presses reuse the one pending reload request"));
+        check(harness.startCalls() == callsBefore + 1,
+              QStringLiteral("two deferred presses reuse the one pending reload request (got %1 new)")
+                  .arg(harness.startCalls() - callsBefore));
         emit harness.options.configChanged();
         check(renamed->minimized == minimizedBefore,
               QStringLiteral("two deferred presses cancel out and toggle nothing"));
         check(harness.console.warnings.isEmpty(),
               QStringLiteral("a replay of nothing warns about nothing: ") + harness.warnings());
+    }
+
+    // ----------------- 3b. the reply of the scripting call applies and replays
+    //
+    // Scripting::start() reparses kwinrc inside the call, so its reply is the
+    // deterministic moment the new values are readable. This is the primary
+    // trigger; the reconfigure fallback below only runs when no reply arrives.
+    {
+        Harness harness;
+        auto *settings = new FakeWindow(QStringLiteral("System Settings"),
+                                        QStringLiteral("systemsettings"));
+        auto *terminal = new FakeWindow(QStringLiteral("alacritty"));
+        auto *renamed = new FakeWindow(QStringLiteral("renamed"));
+        harness.workspace.addWindow(settings);
+        harness.workspace.addWindow(terminal);
+        harness.workspace.addWindow(renamed);
+        harness.host.setConfig(QStringLiteral("WindowName1"), QStringLiteral("^alacritty$"));
+        harness.load(source);
+
+        harness.workspace.activate(settings);
+        press(harness, 0);
+        check(!terminal->minimized, QStringLiteral("the press waits for the reply"));
+        check(harness.startCalls() == 1, QStringLiteral("the request is in flight"));
+
+        harness.host.setConfig(QStringLiteral("WindowName1"), QStringLiteral("^renamed$"));
+        check(harness.deliverReply(),
+              QStringLiteral("the scripting request carries a callable reply callback"));
+        check(renamed->minimized,
+              QStringLiteral("the reply applies the new values and replays the press"));
+        check(!terminal->minimized, QStringLiteral("the stale expression was not used"));
+        check(harness.reconfigureCalls() == 0,
+              QStringLiteral("an answered request costs no reconfigure (got %1)")
+                  .arg(harness.reconfigureCalls()));
+        check(harness.console.warnings.isEmpty(),
+              QStringLiteral("the reply path warns about nothing: ") + harness.warnings());
+
+        // The same reload announced a second time replays nothing.
+        const bool minimizedBefore = renamed->minimized;
+        emit harness.options.configChanged();
+        check(renamed->minimized == minimizedBefore,
+              QStringLiteral("a configChanged after the reply stacks no second replay"));
+        check(harness.startCalls() == 1 && harness.reconfigureCalls() == 0,
+              QStringLiteral("and asks for no further reload"));
     }
 
     // ------------------------------- 4. the real timer deadline and its replay
@@ -543,28 +642,35 @@ int main(int argc, char **argv)
         press(harness, 0);
         check(!terminal->minimized, QStringLiteral("the press waits for the deadline"));
 
-        // KWin reparsed kwinrc, but options.configChanged never arrives, so only
-        // the timeout can pick the new value up.
+        // KWin reparsed kwinrc, but neither the reply nor options.configChanged
+        // arrives, so only the deadlines can pick the new value up: the first
+        // expiry sends the reconfigure fallback, the second one ends the wait.
         harness.host.setConfig(QStringLiteral("WindowName1"), QStringLiteral("^late$"));
 
         check(waitFor([late] {
                   return late->minimized;
-              }, 4000),
-              QStringLiteral("the real 1 s timer fires and replays the pending press"));
+              }, 5000),
+              QStringLiteral("the real deadline fires and replays the pending press"));
 
-        // The bound is what makes a deadline regression visible: changing
-        // CONFIG_TIMEOUT_MS to 2000 ms would still replay the press, just too
-        // late, so the wait itself is measured. The lower bound catches a
-        // deadline that fires far too early.
+        // Both bounds are derived from CONFIG_TIMEOUT_MS in contents/code/main.js,
+        // so moving that constant only needs this one to follow. Two deadlines can
+        // elapse before a silent KWin's press is replayed, and the slack on top is
+        // for a loaded machine; the lower bound catches a deadline that fires far
+        // too early.
+        constexpr qint64 kConfigTimeoutMs = 1000;
+        constexpr qint64 kConfigDeadlines = 2;
         const qint64 replayMs = deadline.elapsed();
-        check(replayMs < 1500,
-              QStringLiteral("the replay happens within 1.5 s of the deferral (took %1 ms)")
+        check(replayMs < kConfigDeadlines * kConfigTimeoutMs + 1000,
+              QStringLiteral("the replay happens within %1 ms of the deferral (took %2 ms)")
+                  .arg(kConfigDeadlines * kConfigTimeoutMs + 1000)
                   .arg(replayMs));
-        check(replayMs >= 500,
-              QStringLiteral("the replay waits for a deadline of about 1 s (took %1 ms)")
+        check(replayMs >= kConfigTimeoutMs / 2,
+              QStringLiteral("the replay does not happen before a deadline of about 1 s elapses (took %1 ms)")
                   .arg(replayMs));
         check(!terminal->minimized,
               QStringLiteral("the re-read expression decided the replay, not the stale one"));
+        check(harness.warnings().contains(QStringLiteral("falling back to reconfigure")),
+              QStringLiteral("the unanswered request is reported once: ") + harness.warnings());
         check(harness.warnings().contains(QStringLiteral("did not confirm the configuration reload")),
               QStringLiteral("the missed confirmation is reported once: ") + harness.warnings());
 
@@ -578,8 +684,11 @@ int main(int argc, char **argv)
         // The replay restored nothing (the window was not minimized before), so a
         // press afterwards must work synchronously again.
         check(harness.reconfigureCalls() == 1,
-              QStringLiteral("the whole deadline path costs exactly one reconfigure (got %1)")
+              QStringLiteral("the silent path costs exactly one reconfigure fallback (got %1)")
                   .arg(harness.reconfigureCalls()));
+        check(harness.startCalls() == 1,
+              QStringLiteral("and exactly one scripting request (got %1)")
+                  .arg(harness.startCalls()));
     }
 
     stream() << Qt::endl;

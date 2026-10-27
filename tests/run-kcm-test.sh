@@ -17,7 +17,8 @@
 #
 # The check is optional by design: without g++, the Qt6/KF6 development headers,
 # kpackagetool6 or KWin's generic scripted configuration plugin it explains what
-# is missing and exits 0.
+# is missing and exits 0. QUAKEWINDOWS_TEST_REQUIRE=1 turns that skip into a
+# failure, so a CI job cannot go green while the coverage silently disappears.
 #
 #   ./tests/run-kcm-test.sh
 #
@@ -37,6 +38,12 @@ skip() {
         echo "      $line"
     done
     echo "      Nothing was built, installed or run."
+    # A CI job must not go green while the coverage silently disappears.
+    if [ "${QUAKEWINDOWS_TEST_REQUIRE:-}" = "1" ]; then
+        echo "FAIL: QUAKEWINDOWS_TEST_REQUIRE=1 asks for this check, but it cannot" >&2
+        echo "      run here: install the dependencies listed above or unset the variable." >&2
+        exit 1
+    fi
     exit 0
 }
 
@@ -105,14 +112,13 @@ if [ -z "$plugin_path" ]; then
 fi
 
 if [ ${#missing[@]} -gt 0 ]; then
-    echo "SKIP: the optional KCM check cannot run here, the following is missing:"
+    lines=()
     for item in "${missing[@]}"; do
-        echo "      - $item"
+        lines+=("- $item")
     done
-    echo "      On Arch/Plasma install: base-devel qt6-base kf6-kcmutils kf6-kconfigwidgets kwin."
-    echo "      The JavaScript, UI and locale suites do not need any of this."
-    echo "      Nothing was built, installed or run."
-    exit 0
+    lines+=("On Arch/Plasma install: base-devel qt6-base kf6-kcmutils kf6-kconfigwidgets kwin.")
+    lines+=("The JavaScript, UI and locale suites do not need any of this.")
+    skip "the optional KCM check cannot run here, the following is missing:" "${lines[@]}"
 fi
 
 # ------------------------------------------------------------------ temp sandbox

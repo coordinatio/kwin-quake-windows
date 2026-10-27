@@ -8,6 +8,13 @@
     <!-- The seven window slots below are mirrored in contents/ui/config.ui
          (kcfg_EnabledN / kcfg_WindowNameN widgets) and in SLOT_COUNT in
          contents/code/main.js; keep the three in sync. -->
+    <!-- The <label> elements below are developer documentation for the entries:
+         they describe a single key, not a form row, and nothing in the settings
+         dialog displays them. They are therefore deliberately not extracted for
+         translation (tools/update-po.sh reads contents/ui/config.ui only). The
+         texts the user actually sees - and the ones that are translated in
+         po/quakewindows.pot and po/ru.po - live in contents/ui/config.ui, so an
+         English-only label here is not a translation gap. -->
     <entry name="Enabled1" type="Bool">
       <default>true</default>
       <label>Window slot 1 is enabled</label>

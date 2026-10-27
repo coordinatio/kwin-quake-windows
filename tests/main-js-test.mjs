@@ -127,12 +127,18 @@ function createContext(state) {
         registerShortcut(id, name, key, callback) {
             harness.shortcuts.push({ id, name, key, callback });
         },
-        callDBus(a, b, c, d) {
+        callDBus(a, b, c, d, ...rest) {
             if (state.dbusThrows) {
                 throw new Error('dbus is broken');
             }
-            // KWin drops error replies, so a failed request is simply silent.
-            harness.dbus.push({ service: a, path: b, iface: c, method: d });
+            // Script::callDBus() takes the last callable argument as the reply
+            // callback and drops it for an error reply, so a call that errors is
+            // simply never answered.
+            let callback = null;
+            if (rest.length && typeof rest[rest.length - 1] === 'function') {
+                callback = rest.pop();
+            }
+            harness.dbus.push({ service: a, path: b, iface: c, method: d, callback });
         },
         QTimer: MockTimer,
         options: { configChanged: signal() },
@@ -211,8 +217,29 @@ function load(state) {
 
 const settingsWindow = () => makeWindow('System Settings', { resourceClass: 'systemsettings' });
 
+// The scripting-interface request that KWin answers, and the reconfigure call
+// that is only the fallback for a KWin that does not answer it.
+function startCalls() {
+    return harness.dbus.filter((call) => call.method === 'start');
+}
+
 function reconfigureCalls() {
     return harness.dbus.filter((call) => call.method === 'reconfigure');
+}
+
+// Every way the script can ask KWin for fresh values.
+function reloadCalls() {
+    return harness.dbus.filter((call) => call.method === 'start' || call.method === 'reconfigure');
+}
+
+// Delivers the reply of the newest scripting-interface request the way KWin does
+// it for the void start() slot: the callback runs with no arguments.
+function deliverReply(call) {
+    const request = call || startCalls()[startCalls().length - 1];
+    assert.ok(request, 'a scripting-interface request was made');
+    assert.equal(typeof request.callback, 'function',
+        'the request carries the reply callback');
+    request.callback();
 }
 
 function runningTimers() {
@@ -285,10 +312,10 @@ function pendingIndexes(context) {
     }, 'init creates no timer object at all and leaves the configuration timer unarmed');
 
     check(() => {
-        assert.equal(reconfigureCalls().length, 0);
+        assert.equal(reloadCalls().length, 0);
         assert.equal(harness.warnings.length, 0);
         assert.match(harness.infos.join('\n'), /active slots: none/);
-    }, 'unconfigured slots are inactive and no reconfigure is requested on startup');
+    }, 'unconfigured slots are inactive and no reload is requested on startup');
 }
 
 // ================================= 1b. applyConfig() failing during init() (finding 1)
@@ -498,7 +525,7 @@ function assertGenerationIntact(context, before) {
 
     check(() => {
         // Nothing toggled above, so the configuration never became stale.
-        assert.equal(reconfigureCalls().length, 0);
+        assert.equal(reloadCalls().length, 0);
         assert.deepEqual(pendingIndexes(context), []);
     }, 'pressing an inactive slot does not request a configuration reload');
 }
@@ -514,7 +541,7 @@ function assertGenerationIntact(context, before) {
         const logged = harness.infos.slice(before).join('\n');
         assert.match(logged, /no window matches slot 1/);
         assert.equal(window1.minimized, false, 'nothing was toggled');
-        assert.equal(reconfigureCalls().length, 0,
+        assert.equal(reloadCalls().length, 0,
             'a valid expression never requests a reload');
     }, 'a slot with a valid expression that matches nothing logs one info line');
 
@@ -646,7 +673,7 @@ function assertGenerationIntact(context, before) {
         activate(context2, undefined);
         activate(context2, null);
         harness.shortcuts[3].callback();
-        assert.equal(reconfigureCalls().length, 0, 'undefined properties are not a settings window');
+        assert.equal(reloadCalls().length, 0, 'undefined properties are not a settings window');
     }, 'undefined caption/resourceClass/resourceName never throw and never look like a settings window');
 }
 
@@ -659,24 +686,27 @@ function assertGenerationIntact(context, before) {
     check(() => {
         activate(context, settingsWindow());
         assert.equal(context.settingsWindowSeen, true);
-        assert.equal(reconfigureCalls().length, 0,
-            'activating the dialog alone must not reconfigure');
+        assert.equal(reloadCalls().length, 0,
+            'activating the dialog alone must not request a reload');
         activate(context, makeWindow('other'));
         assert.equal(context.settingsWindowSeen, false);
         assert.equal(context.awaitingConfig, true);
-        assert.equal(reconfigureCalls().length, 1, 'leaving the dialog reconfigures once');
-        assert.deepEqual(reconfigureCalls()[0], {
-            service: 'org.kde.KWin',
-            path: '/KWin',
-            iface: 'org.kde.KWin',
-            method: 'reconfigure',
-        });
-    }, 'focus entering and leaving the settings dialog triggers exactly one reconfigure');
+        assert.equal(reloadCalls().length, 1, 'leaving the dialog requests one reload');
+        assert.equal(reconfigureCalls().length, 0,
+            'the cheap scripting request is the primary trigger, not reconfigure');
+        const request = startCalls()[0];
+        assert.equal(request.service, 'org.kde.KWin');
+        assert.equal(request.path, '/Scripting');
+        assert.equal(request.iface, 'org.kde.kwin.Scripting');
+        assert.equal(request.method, 'start');
+        assert.equal(typeof request.callback, 'function',
+            'the reply callback is the last argument, as Script::callDBus() expects');
+    }, 'focus entering and leaving the settings dialog triggers exactly one reload request');
 
     check(() => {
         activate(context, makeWindow('other'));
         activate(context, makeWindow('another'));
-        assert.equal(reconfigureCalls().length, 1,
+        assert.equal(reloadCalls().length, 1,
             'no request is repeated while configChanged is still missing');
         const timer = configTimer(context);
         assert.equal(timer.singleShot, true, 'the deadline is single shot');
@@ -684,7 +714,7 @@ function assertGenerationIntact(context, before) {
         assert.equal(timer.running, true, 'the deadline of the unanswered request is armed');
         assert.deepEqual(runningTimers(), [timer],
             'exactly one timer object is armed for a plain focus change');
-    }, 'no repeated reconfigure requests while the previous one is unanswered');
+    }, 'no repeated reload requests while the previous one is unanswered');
 
     check(() => {
         config.WindowName2 = '^second window$';
@@ -702,11 +732,112 @@ function assertGenerationIntact(context, before) {
     check(() => {
         activate(context, settingsWindow());
         activate(context, makeWindow('third'));
-        assert.equal(reconfigureCalls().length, 2,
+        assert.equal(reloadCalls().length, 2,
             'a completed reload allows the next dialog visit to reload again');
         emitConfigChanged(context);
         assert.equal(context.awaitingConfig, false);
     }, 'a second dialog visit reloads again once the previous reload completed');
+}
+
+// ===================== 4b. the reply of the scripting call is the trigger (finding 1)
+//
+// Scripting::start() reparses kwinrc inside the call, so its reply is a
+// deterministic "the configuration is fresh now" moment: the callback applies the
+// values and replays what was queued, without waiting for the deadline and
+// without a reconfigure.
+{
+    const window1 = makeWindow('first title');
+    const second = makeWindow('second window');
+    const { context, config } = load({ WindowName1: '^first title$', windows: [window1, second] });
+
+    check(() => {
+        activate(context, settingsWindow());
+        harness.shortcuts[0].callback();
+        assert.deepEqual(pendingIndexes(context), [0], 'the press is deferred');
+        assert.equal(startCalls().length, 1, 'one scripting request waits for its reply');
+
+        // KWin reparsed the file inside the call, so readConfig() already returns
+        // the new value when the reply arrives.
+        config.WindowName1 = '^second window$';
+        deliverReply();
+
+        assert.equal(context.awaitingConfig, false, 'the reply settles the request');
+        assert.equal(context.configFallbackSent, false, 'and needs no fallback');
+        assert.equal(reconfigureCalls().length, 0, 'a reply costs no reconfigure');
+        assert.equal(configTimer(context).running, false, 'the deadline is stopped');
+        assert.deepEqual(pendingIndexes(context), [], 'the press was replayed');
+        assert.equal(second.minimized, true, 'with the fresh expression');
+        assert.equal(window1.minimized, false, 'not with the old one');
+        assert.equal(harness.warnings.length, 0, 'nothing warns');
+    }, 'the reply of the scripting call applies the configuration and replays the press');
+
+    check(() => {
+        // The same reload announced twice - the reply and a configChanged - must
+        // apply and replay once.
+        activate(context, settingsWindow());
+        harness.shortcuts[0].callback();
+        assert.deepEqual(pendingIndexes(context), [0], 'again deferred');
+        config.WindowName1 = '^first title$';
+        deliverReply();
+        assert.equal(window1.minimized, true, 'the reply replayed the press');
+        const toggled = window1.minimized;
+
+        emitConfigChanged(context);         // the same reload, announced again
+        assert.equal(window1.minimized, toggled, 'a second notification replays nothing');
+        assert.deepEqual(pendingIndexes(context), [], 'the queue stays empty');
+        assert.equal(reloadCalls().length, 2, 'no extra request either');
+    }, 'a reply and a configChanged for the same reload replay the queue once');
+
+    check(() => {
+        // The other order: configChanged first, then the reply of the request that
+        // was already settled by it.
+        activate(context, settingsWindow());
+        harness.shortcuts[0].callback();
+        assert.deepEqual(pendingIndexes(context), [0], 'deferred once more');
+        config.WindowName1 = '^second window$';
+        emitConfigChanged(context);
+        assert.equal(second.minimized, false, 'configChanged replayed the press');
+        deliverReply();                     // the reply arrives afterwards
+        assert.equal(second.minimized, false, 'the late reply replays nothing');
+        assert.equal(configTimer(context).running, false, 'and leaves no deadline armed');
+        assert.equal(reconfigureCalls().length, 0, 'still no reconfigure');
+    }, 'a reply arriving after configChanged does not replay the queue twice');
+}
+
+// ============== 4c. a late reply of an older request is ignored (finding 1)
+{
+    const window1 = makeWindow('first title');
+    const { context } = load({ WindowName1: '^first title$', windows: [window1] });
+
+    check(() => {
+        activate(context, settingsWindow());
+        harness.shortcuts[0].callback();          // request #1, press deferred
+        const firstReply = startCalls()[0];
+
+        // Both deadlines pass, so request #1 is given up and the press replayed.
+        configTimer(context).fire();
+        configTimer(context).fire();
+        assert.equal(context.awaitingConfig, false);
+        assert.equal(window1.minimized, true, 'the first press was replayed');
+
+        harness.shortcuts[0].callback();          // request #2, deferred again
+        assert.deepEqual(pendingIndexes(context), [0], 'the second press is deferred');
+        assert.equal(context.awaitingConfig, true);
+        assert.equal(startCalls().length, 2);
+
+        // The reply of request #1 finally arrives: it must not complete #2.
+        deliverReply(firstReply);
+        assert.equal(context.awaitingConfig, true,
+            'a reply of the older request leaves the newer one pending');
+        assert.deepEqual(pendingIndexes(context), [0], 'and replays nothing');
+        assert.equal(configTimer(context).running, true, 'the deadline stays armed');
+
+        deliverReply();                            // the reply of request #2
+        assert.equal(context.awaitingConfig, false);
+        assert.deepEqual(pendingIndexes(context), [], 'the press is replayed');
+        assert.equal(window1.minimized, false, 'and toggles back exactly once');
+        assert.equal(reconfigureCalls().length, 1, 'only the one fallback of request #1');
+    }, 'a late reply of an older request does not settle the newer one');
 }
 
 // ============================================ 5. deferred hotkey press and replay
@@ -723,7 +854,7 @@ function assertGenerationIntact(context, before) {
         assert.equal(window1.minimized, false, 'the stale window is not toggled');
         assert.equal(second.minimized, false);
         assert.deepEqual(pendingIndexes(context), [0], 'the press is pending');
-        assert.equal(reconfigureCalls().length, 1, 'the press requests a reload itself');
+        assert.equal(reloadCalls().length, 1, 'the press requests a reload itself');
         const timer = configTimer(context);
         assert.equal(timer.singleShot, true);
         assert.equal(timer.interval, 1000);
@@ -747,7 +878,7 @@ function assertGenerationIntact(context, before) {
         activate(context, window1);
         assert.equal(context.settingsWindowSeen, false,
             'the focus change clears the latch');
-        assert.equal(reconfigureCalls().length, 2,
+        assert.equal(reloadCalls().length, 2,
             'the dialog is gone now, so its Apply is picked up by one reload');
         assert.equal(context.awaitingConfig, true);
 
@@ -764,15 +895,15 @@ function assertGenerationIntact(context, before) {
     check(() => {
         // A press that arrives while a reload is already pending is folded into the
         // parity flag without sending a second D-Bus call.
-        const before = reconfigureCalls().length;
+        const before = reloadCalls().length;
         activate(context, settingsWindow());
-        activate(context, window1);              // focus loss -> reconfigure #before+1
-        assert.equal(reconfigureCalls().length, before + 1);
+        activate(context, window1);              // focus loss -> reload #before+1
+        assert.equal(reloadCalls().length, before + 1);
         assert.equal(context.awaitingConfig, true);
         harness.shortcuts[1].callback();          // press while awaitingConfig
         assert.deepEqual(pendingIndexes(context), [1], 'one press is pending for slot 2');
         harness.shortcuts[1].callback();          // and once more
-        assert.equal(reconfigureCalls().length, before + 1,
+        assert.equal(reloadCalls().length, before + 1,
             'the pending reload is reused instead of being requested again');
         assert.deepEqual(pendingIndexes(context), [], 'two presses cancel out per slot');
         const target = makeWindow('third title');
@@ -821,13 +952,13 @@ function assertGenerationIntact(context, before) {
         harness.shortcuts[0].callback();
         assert.equal(window1.minimized, true, 'the press is deferred, not toggled');
         assert.deepEqual(pendingIndexes(context), [0]);
-        assert.equal(reconfigureCalls().length, 1);
+        assert.equal(reloadCalls().length, 1);
 
         // configChanged arrives while the dialog is still focused: the replay
         // restores the window, which activates it.
         emitConfigChanged(context);
         assert.equal(window1.minimized, false, 'the pending press restored the window');
-        assert.equal(reconfigureCalls().length, 1,
+        assert.equal(reloadCalls().length, 1,
             'replaying a press must not request another reload');
         assert.equal(context.awaitingConfig, false);
         assert.equal(context.replaying, false, 'the replay flag is cleared by finally');
@@ -843,7 +974,7 @@ function assertGenerationIntact(context, before) {
         harness.shortcuts[0].callback();
         assert.equal(window1.minimized, false, 'the press is deferred again');
         assert.deepEqual(pendingIndexes(context), [0]);
-        assert.equal(reconfigureCalls().length, 2, 'and it asks for a reload');
+        assert.equal(reloadCalls().length, 2, 'and it asks for a reload');
         assert.equal(context.awaitingConfig, true);
     }, 'a second Apply is still detected while the dialog stays focused');
 }
@@ -871,7 +1002,7 @@ function assertGenerationIntact(context, before) {
         harness.shortcuts[0].callback();
         assert.equal(window1.minimized, false, 'the press is deferred nonetheless');
         assert.deepEqual(pendingIndexes(context), [0], 'and it is remembered');
-        assert.equal(reconfigureCalls().length, 2, 'the press asks for a reload itself');
+        assert.equal(reloadCalls().length, 2, 'the press asks for a reload itself');
     }, 'a press while a settings window is focused is deferred even when the latch is cleared');
 }
 
@@ -885,31 +1016,31 @@ function assertGenerationIntact(context, before) {
         // becoming active, so nothing cleared the latch before this press.
         activate(context, settingsWindow());
         assert.equal(context.settingsWindowSeen, true);
-        assert.equal(reconfigureCalls().length, 0);
+        assert.equal(reloadCalls().length, 0);
 
         harness.shortcuts[0].callback();
         assert.deepEqual(pendingIndexes(context), [0], 'the press is deferred');
-        assert.equal(reconfigureCalls().length, 1, 'and it pays exactly one reconfigure');
+        assert.equal(reloadCalls().length, 1, 'and it pays exactly one reload request');
 
         emitConfigChanged(context);
         assert.equal(window1.minimized, true, 'the deferred press is replayed');
         assert.equal(context.settingsWindowSeen, true,
             'the reload keeps the latch: the dialog is still the active window');
-    }, 'a latched settings flag costs one reconfigure and is not cleared behind the dialog');
+    }, 'a latched settings flag costs one reload request and is not cleared behind the dialog');
 
     check(() => {
         // Focus finally leaves the dialog and the reload it triggers lands with a
         // normal window focused, which is what clears the latch.
         activate(context, window1);
         assert.equal(context.settingsWindowSeen, false, 'the focus change clears the latch');
-        assert.equal(reconfigureCalls().length, 2);
+        assert.equal(reloadCalls().length, 2);
         emitConfigChanged(context);
         assert.equal(context.settingsWindowSeen, false,
             'a reload with a normal window focused keeps the latch cleared');
 
         harness.shortcuts[0].callback();
         assert.equal(window1.minimized, false, 'the press toggles immediately');
-        assert.equal(reconfigureCalls().length, 2, 'no reload is requested any more');
+        assert.equal(reloadCalls().length, 2, 'no reload is requested any more');
         assert.deepEqual(pendingIndexes(context), [], 'nothing is pending');
     }, 'after the healing reload a press is not deferred again');
 }
@@ -978,16 +1109,16 @@ function assertGenerationIntact(context, before) {
         activate(context, settingsWindow());
         harness.shortcuts[0].callback();
         assert.deepEqual(pendingIndexes(context), [0], 'the press is deferred');
-        assert.equal(reconfigureCalls().length, 1);
+        assert.equal(reloadCalls().length, 1);
 
         // The Wayland restore path may deliver windowActivated only after the
         // replay returned, i.e. with `replaying` already false. The flag only
         // suppresses the synchronous variant; the latch the synchronous one
-        // cleared is what keeps the late delivery from costing a reconfigure.
-        configTimer(context).fire();
+        // cleared is what keeps the late delivery from costing a reload.
+        deliverReply();
         assert.deepEqual(pendingIndexes(context), [], 'no press is lost');
         assert.equal(window1.minimized, false, 'the press toggled the window exactly once');
-        assert.equal(reconfigureCalls().length, 1,
+        assert.equal(reloadCalls().length, 1,
             'the synchronous activation caused by the replay is suppressed');
         assert.equal(context.settingsWindowSeen, false,
             'the replayed restore of a normal window cleared the latch');
@@ -995,8 +1126,8 @@ function assertGenerationIntact(context, before) {
         activate(context, window1);   // the same activation, delivered late
         assert.deepEqual(pendingIndexes(context), [], 'still no press is lost');
         assert.equal(window1.minimized, false, 'and nothing is toggled twice');
-        assert.equal(reconfigureCalls().length, 1,
-            'the late activation of the same window costs no reconfigure');
+        assert.equal(reloadCalls().length, 1,
+            'the late activation of the same window costs no reload');
     }, 'a windowActivated delivered after the replay loses no press and costs no reload');
 }
 
@@ -1012,7 +1143,7 @@ function assertGenerationIntact(context, before) {
         assert.equal(context.settingsWindowSeen, true);
         activate(context, normal);                 // focus loss -> reload, latch cleared
         assert.equal(context.settingsWindowSeen, false);
-        assert.equal(reconfigureCalls().length, 1);
+        assert.equal(reloadCalls().length, 1);
 
         harness.shortcuts[0].callback();            // deferred while awaitingConfig
         assert.deepEqual(pendingIndexes(context), [0], 'the press is deferred');
@@ -1024,14 +1155,14 @@ function assertGenerationIntact(context, before) {
         emitConfigChanged(context);
         assert.equal(dialog.minimized, false, 'the replayed press restored the dialog');
         assert.equal(context.replaying, false, 'the replay flag is cleared by finally');
-        assert.equal(reconfigureCalls().length, 1, 'the replay requested no reload');
+        assert.equal(reloadCalls().length, 1, 'the replay requested no reload');
         assert.equal(context.settingsWindowSeen, true,
             'a settings window activated by the replay re-arms the latch');
 
         activate(context, normal);                 // leaving it is noticed again
         assert.equal(context.awaitingConfig, true);
         assert.equal(context.settingsWindowSeen, false, 'the focus loss clears the latch');
-        assert.equal(reconfigureCalls().length, 2,
+        assert.equal(reloadCalls().length, 2,
             'the re-armed latch picks up the next focus loss');
     }, 'a settings window activated during a replay re-arms the latch without a reload');
 }
@@ -1052,7 +1183,7 @@ function assertGenerationIntact(context, before) {
         assert.equal(context.settingsWindowSeen, true);
         harness.shortcuts[0].callback();
         assert.deepEqual(pendingIndexes(context), [0], 'the press is deferred');
-        assert.equal(reconfigureCalls().length, 1);
+        assert.equal(reloadCalls().length, 1);
 
         // The dialog is still the active window when the answer arrives, so the
         // reload itself keeps the latch; the replay then restores the hidden
@@ -1061,28 +1192,32 @@ function assertGenerationIntact(context, before) {
         assert.equal(window1.minimized, false, 'the replayed press restored the window');
         assert.equal(context.settingsWindowSeen, false,
             'the normal window activated by the replay cleared the latch');
-        assert.equal(reconfigureCalls().length, 1, 'and requested no reload');
+        assert.equal(reloadCalls().length, 1, 'and requested no reload');
 
         // The next press is not deferred a second time.
         harness.shortcuts[0].callback();
         assert.equal(window1.minimized, true, 'the next press toggles immediately');
         assert.deepEqual(pendingIndexes(context), [], 'nothing stays pending');
-        assert.equal(reconfigureCalls().length, 1, 'and requests no reload either');
+        assert.equal(reloadCalls().length, 1, 'and requests no reload either');
     }, 'a replay that activates a normal window clears the settings latch without a reload');
 }
 
 // ===================================== 6. the configuration deadline (finding 4)
 //
-// One timer answers both questions: a deferred press always has a deadline, and
-// an unanswered reload request cannot latch. Both paths are driven through it.
+// One timer answers three questions: a deferred press always has a deadline, an
+// unanswered reload request cannot latch, and the reconfigure fallback is given a
+// deadline of its own instead of one per press. The two expiries of one request
+// are driven here: the first sends the fallback, the second gives up.
 {
     const window1 = makeWindow('first title');
     const { context } = load({ WindowName1: '^first title$', windows: [window1] });
 
     check(() => {
         activate(context, settingsWindow());
-        activate(context, makeWindow('other'));   // focus loss -> reconfigure
+        activate(context, makeWindow('other'));   // focus loss -> reload request
         assert.equal(context.awaitingConfig, true);
+        assert.equal(startCalls().length, 1, 'exactly one scripting request is in flight');
+        assert.equal(reconfigureCalls().length, 0, 'no reconfigure before the deadline');
         const timer = configTimer(context);
         assert.equal(timer.singleShot, true, 'the deadline is single shot');
         assert.equal(timer.interval, 1000, 'the deadline fires after 1000 ms');
@@ -1095,15 +1230,41 @@ function assertGenerationIntact(context, before) {
     check(() => {
         const warningsBefore = harness.warnings.length;
         assert.equal(configTimer(context).fire(), true, 'the armed deadline fires');
-        assert.equal(context.awaitingConfig, false, 'a stuck reload request is cleared');
-        assert.equal(context.configTimerArmed, false, 'the fired deadline is no longer armed');
+
+        // First expiry: the scripting request was not answered, so the fallback
+        // that works on every KWin is sent - exactly once - and the deadline is
+        // re-armed to give its options.configChanged a chance.
+        assert.equal(context.configFallbackSent, true, 'the fallback is on its way');
+        assert.equal(context.awaitingConfig, true,
+            'the reload is still pending after the fallback');
         assert.equal(harness.warnings.length, warningsBefore + 1, 'exactly one warning is logged');
         assert.match(harness.warnings[harness.warnings.length - 1],
+            /did not answer the script reload request, falling back to reconfigure/);
+        assert.equal(reconfigureCalls().length, 1, 'the fallback is sent once');
+        assert.equal(reconfigureCalls()[0].service, 'org.kde.KWin');
+        assert.equal(reconfigureCalls()[0].path, '/KWin');
+        assert.equal(reconfigureCalls()[0].iface, 'org.kde.KWin');
+        assert.equal(reconfigureCalls()[0].method, 'reconfigure');
+        assert.equal(context.configTimerArmed, true,
+            'the fallback gets a deadline of its own');
+        assert.equal(configTimer(context).running, true);
+
+        // Second expiry: the fallback did not answer either, so the current
+        // values are the best ones available.
+        assert.equal(configTimer(context).fire(), true, 'the second expiry fires too');
+        assert.equal(context.awaitingConfig, false, 'a stuck reload request is cleared');
+        assert.equal(context.configFallbackSent, false, 'a later request starts clean');
+        assert.equal(context.configTimerArmed, false, 'the fired deadline is no longer armed');
+        assert.equal(harness.warnings.length, warningsBefore + 2,
+            'the second expiry logs its own single line');
+        assert.match(harness.warnings[harness.warnings.length - 1],
             /did not confirm the configuration reload/);
+        assert.equal(reconfigureCalls().length, 1,
+            'the fallback is not repeated on the second expiry');
         assert.equal(configTimer(context).fire(), false,
             'the stopped deadline delivers nothing');
-        assert.equal(harness.warnings.length, warningsBefore + 1, 'the warning is logged once');
-    }, 'the deadline unsticks an unconfirmed reload and warns exactly once');
+        assert.equal(harness.warnings.length, warningsBefore + 2, 'nothing warns again');
+    }, 'the first expiry sends one reconfigure fallback and the second gives up');
 
     check(() => {
         // A later press must not wait for a deadline any more.
@@ -1112,14 +1273,17 @@ function assertGenerationIntact(context, before) {
         assert.deepEqual(pendingIndexes(context), [], 'nothing is pending');
         assert.equal(configTimer(context).running, false, 'the deadline is not armed again');
         assert.equal(context.configTimerArmed, false);
-        assert.equal(reconfigureCalls().length, 1, 'no extra reload request');
+        assert.equal(startCalls().length, 1, 'no new scripting request either');
+        assert.equal(reconfigureCalls().length, 1, 'and no new fallback');
         assert.equal(harness.timers.length, 1, 'no second timer object was created');
     }, 'after the deadline a press is not delayed any more');
 
     check(() => {
         activate(context, settingsWindow());
-        activate(context, makeWindow('other'));   // reconfigure #2, deadline re-armed
-        assert.equal(reconfigureCalls().length, 2);
+        activate(context, makeWindow('other'));   // reload #2, deadline re-armed
+        assert.equal(startCalls().length, 2);
+        assert.equal(context.configFallbackSent, false,
+            'a fresh request forgets the fallback of the previous one');
         assert.equal(configTimer(context).running, true, 'the deadline is armed again');
         assert.equal(context.configTimerArmed, true);
         emitConfigChanged(context);
@@ -1154,7 +1318,7 @@ function assertGenerationIntact(context, before) {
             'the parity flip is undone, nothing stays queued');
         assert.equal(context.configTimer, null, 'there is no timer to fire');
         assert.equal(harness.timers.length, 0, 'no timer object exists at all');
-        assert.equal(reconfigureCalls().length, 1,
+        assert.equal(reloadCalls().length, 1,
             'the reload request was still made, so the new values may still arrive');
     }, 'a press with no timer falls back to a synchronous toggle and warns once');
 
@@ -1164,13 +1328,13 @@ function assertGenerationIntact(context, before) {
         // deadline can end it, so the press sends its own request instead of
         // returning early on a request nothing will ever settle.
         const warningsBefore = harness.warnings.length;
-        const callsBefore = reconfigureCalls().length;
+        const callsBefore = reloadCalls().length;
         harness.shortcuts[0].callback();
         assert.equal(harness.warnings.length, warningsBefore,
             'the missing timer is reported once, not on every press');
         assert.equal(window1.minimized, false, 'the second press toggles back');
         assert.deepEqual(pendingIndexes(context), [], 'again nothing is queued');
-        assert.equal(reconfigureCalls().length, callsBefore + 2,
+        assert.equal(reloadCalls().length, callsBefore + 2,
             'the press sends its own request, and restoring the window counts as ' +
             'a focus loss that asks once more (KWin coalesces them)');
         assert.equal(context.awaitingConfig, false,
@@ -1229,17 +1393,17 @@ function assertGenerationIntact(context, before) {
         assert.equal(context.configTimer.fire(), false,
             'firing it delivers no timeout');
         assert.equal(window1.minimized, true, 'and therefore toggles nothing again');
-        assert.equal(reconfigureCalls().length, 1,
+        assert.equal(reloadCalls().length, 1,
             'the reload request was still made, so the new values may still arrive');
     }, 'a timer whose start() throws does not strand the press');
 
     check(() => {
         // The next press is not blocked by a latch that could never be cleared.
-        const callsBefore = reconfigureCalls().length;
+        const callsBefore = reloadCalls().length;
         harness.shortcuts[0].callback();
         assert.equal(window1.minimized, false, 'the next press toggles back');
         assert.deepEqual(pendingIndexes(context), [], 'still nothing queued');
-        assert.equal(reconfigureCalls().length, callsBefore + 2,
+        assert.equal(reloadCalls().length, callsBefore + 2,
             'each press sends its own request; restoring the window adds the ' +
             'focus-loss request (KWin coalesces them) instead of returning early');
         assert.equal(context.configTimerArmed, false);
@@ -1259,7 +1423,7 @@ function assertGenerationIntact(context, before) {
         // warning would repeat per arm, not per press. The timer cannot start
         // working later in the session, so both lines are worth one report.
         activate(context, settingsWindow());
-        const callsBefore = reconfigureCalls().length;
+        const callsBefore = reloadCalls().length;
         harness.shortcuts[0].callback();
         harness.shortcuts[1].callback();
         harness.shortcuts[0].callback();
@@ -1273,7 +1437,7 @@ function assertGenerationIntact(context, before) {
         assert.equal(fallbackWarnings.length, 1,
             'exactly one fallback warning for the whole session (got '
             + fallbackWarnings.length + ')');
-        assert.equal(reconfigureCalls().length - callsBefore, 4,
+        assert.equal(reloadCalls().length - callsBefore, 4,
             'every press still sends its own request, and the activation caused ' +
             'by the last one adds the focus-loss request');
     }, 'a start() that throws warns once per session across several presses');
@@ -1301,7 +1465,7 @@ function assertGenerationIntact(context, before) {
         assert.deepEqual(pendingIndexes(context), [],
             'the parity flip is undone, nothing stays queued');
         assert.equal(context.awaitingConfig, false, 'no reload is left pending');
-        assert.equal(reconfigureCalls().length, 0, 'the request never reached KWin');
+        assert.equal(reloadCalls().length, 0, 'the request never reached KWin');
         const warnings = harness.warnings.join('\n');
         assert.match(warnings,
             /could not ask KWin to reload its configuration: .*dbus is broken/);
@@ -1346,7 +1510,7 @@ function assertGenerationIntact(context, before) {
     check(() => {
         assert.equal(context.settingsWindowSeen, true,
             'a settings window that is active at load time is imported');
-        assert.equal(reconfigureCalls().length, 0, 'loading the script does not reconfigure');
+        assert.equal(reloadCalls().length, 0, 'loading the script requests no reload');
         assert.equal(context.configTimer, null);
         assert.equal(harness.timers.length, 0);
     }, 'init() notices a settings window that is already active');
@@ -1354,7 +1518,7 @@ function assertGenerationIntact(context, before) {
     check(() => {
         activate(context, makeWindow('other'));
         assert.equal(context.settingsWindowSeen, false);
-        assert.equal(reconfigureCalls().length, 1, 'its Apply is not missed');
+        assert.equal(reloadCalls().length, 1, 'its Apply is not missed');
     }, 'leaving the already-active settings window requests one reload');
 }
 
@@ -1532,6 +1696,10 @@ function assertGenerationIntact(context, before) {
 }
 
 // ================================================== 9. the deadline replays a press
+//
+// The scripting request was not answered and the reconfigure fallback was not
+// answered either: the second expiry is what ends the wait with the values that
+// are available, so the queued press is not lost.
 {
     const window1 = makeWindow('first title');
     const { context, config } = load({ WindowName1: '^first title$', windows: [window1] });
@@ -1542,21 +1710,29 @@ function assertGenerationIntact(context, before) {
         assert.equal(window1.minimized, false, 'the press is deferred');
         assert.deepEqual(pendingIndexes(context), [0]);
 
-        // KWin reparsed kwinrc but the configChanged signal was lost: only now,
-        // after the deadline is armed, does readConfig() start returning new values.
+        // KWin reparsed kwinrc but neither the reply nor configChanged arrives, so
+        // only the deadlines can pick the new values up.
         const renamed = makeWindow('renamed');
         context.workspace.windows = [window1, renamed];
         config.WindowName1 = '^renamed$';
 
         const warningsBefore = harness.warnings.length;
-        configTimer(context).fire();  // KWin never sends configChanged
-        assert.equal(harness.warnings.length, warningsBefore + 1, 'one warning is logged');
+        assert.equal(configTimer(context).fire(), true, 'the first expiry fires');
+        assert.equal(reconfigureCalls().length, 1, 'and sends the one fallback');
+        assert.deepEqual(pendingIndexes(context), [0],
+            'the fallback gets its deadline before the press is replayed');
+        assert.equal(renamed.minimized, false, 'nothing is replayed yet');
+
+        assert.equal(configTimer(context).fire(), true, 'the second expiry fires');
+        assert.equal(harness.warnings.length, warningsBefore + 2,
+            'one line for the fallback, one for giving up');
         assert.match(harness.warnings[harness.warnings.length - 1], /did not confirm the configuration reload/);
         assert.deepEqual(pendingIndexes(context), [], 'no press is pending any more');
         assert.equal(context.awaitingConfig, false, 'the state machine is unstuck');
         assert.equal(renamed.minimized, true, 'the replayed press used the re-read expression');
         assert.equal(window1.minimized, false, 'the old expression was not used');
-    }, 'the configuration deadline re-reads the configuration and replays the pending press');
+        assert.equal(reloadCalls().length, 2, 'one scripting request and one fallback');
+    }, 'after two silent deadlines the configuration is re-read and the press replayed');
 
     check(() => {
         // A late configChanged must not toggle the same press twice.
@@ -1577,6 +1753,37 @@ function assertGenerationIntact(context, before) {
             'nothing is left to warn about once awaitingConfig is clear');
         assert.equal(harness.infos.length, infosBefore, 'the configuration is not re-read');
     }, 'an empty pending set on the configuration deadline does nothing');
+}
+
+// ============ 9b. the fallback's configChanged replays the queued press
+//
+// The path an older KWin without the scripting method takes: no reply ever
+// arrives, so the first deadline sends the reconfigure fallback, and its
+// options.configChanged is what applies the new values and replays the press.
+{
+    const terminal = makeWindow('alacritty');
+    const renamed = makeWindow('renamed');
+    const { context, config } = load({ WindowName1: '^alacritty$', windows: [terminal, renamed] });
+
+    check(() => {
+        activate(context, settingsWindow());
+        harness.shortcuts[0].callback();
+        assert.deepEqual(pendingIndexes(context), [0], 'the press is deferred');
+
+        config.WindowName1 = '^renamed$';
+        assert.equal(configTimer(context).fire(), true, 'the first deadline fires');
+        assert.equal(reconfigureCalls().length, 1, 'the reconfigure fallback is sent');
+        assert.deepEqual(pendingIndexes(context), [0],
+            'the press waits for the fallback to answer, not for the old values');
+
+        emitConfigChanged(context);            // KWin's answer to the fallback
+        assert.deepEqual(pendingIndexes(context), [], 'the press is replayed');
+        assert.equal(renamed.minimized, true, 'with the fresh expression');
+        assert.equal(terminal.minimized, false, 'not with the stale one');
+        assert.equal(configTimer(context).running, false, 'the fallback deadline is stopped');
+        assert.equal(harness.warnings.length, 1, 'only the fallback line was written');
+        assert.match(harness.warnings[0], /falling back to reconfigure/);
+    }, "the fallback reconfigure's configChanged replays the press it was sent for");
 }
 
 // =============================================== 10. per-slot press parity (finding 4)
@@ -1731,7 +1938,7 @@ const SETTINGS_DESKTOP_FILES = [
 
     check(() => {
         // The negative row: a browser names itself in all three sources and must
-        // stay a normal window, otherwise every focus loss would reconfigure KWin.
+        // stay a normal window, otherwise every focus loss would request a reload.
         const { context } = load({ windows: [] });
         activate(context, makeWindow('Mozilla Firefox', {
             resourceClass: 'Navigator',

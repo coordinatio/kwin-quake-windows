@@ -18,20 +18,24 @@
 
    KWin only re-reads kwinrc when it reconfigures itself, and the generic scripted
    configuration module does not notify KWin after writing the file. The script
-   therefore asks KWin to reconfigure when the settings dialog loses focus and
-   defers a press that arrives before the new values are visible, because
-   readConfig() cannot be refreshed synchronously. See "How configuration
-   reloading works" in README.md for the whole sequence and the trade-offs.
+   therefore asks KWin to re-read the file through its scripting interface
+   (org.kde.kwin.Scripting.start) when the settings dialog loses focus and defers
+   a press that arrives before the new values are visible, because readConfig()
+   cannot be refreshed synchronously. A plain reconfigure, which works on every
+   KWin, is the fallback for a KWin that does not answer the scripting call. See
+   "How configuration reloading works" in README.md for the whole sequence and
+   the trade-offs.
 */
 
 var SLOT_COUNT = 7;
 
-// The one deadline of the configuration machinery. It carries two guarantees:
-// every deferred press has a deadline, and a reload request that KWin never
-// answers cannot latch, because callDBus() drops error replies and a timeout is
-// the only way out. The request and every deferred press re-arm it, so it fires
-// CONFIG_TIMEOUT_MS after the last event that needed it, and whichever of the two
-// happened last is handled by the same handler.
+// The one deadline of the configuration machinery. It carries three guarantees:
+// every deferred press has a deadline, a reload request that KWin never answers
+// cannot latch, because callDBus() drops error replies and a timeout is the only
+// way out, and the reconfigure fallback sent by the first expiry is given a
+// deadline of its own. Both the request, every deferred press and the fallback
+// re-arm it, so it fires CONFIG_TIMEOUT_MS after the last event that needed it,
+// and whichever of those happened last is handled by the same handler.
 var CONFIG_TIMEOUT_MS = 1000;
 
 var slotRegex = [];
@@ -53,8 +57,18 @@ var configSignature = null;
 // the active window on every reload, so it cannot latch.
 var settingsWindowSeen = false;
 
-// A reconfigure was requested and options.configChanged has not arrived yet.
+// A reload was requested and neither the reply of the scripting call nor
+// options.configChanged has settled it yet.
 var awaitingConfig = false;
+
+// The deadline of the current request expired once already and its reconfigure
+// fallback was sent. Makes the fallback one per request instead of one per
+// expiry, and turns the next expiry into "give up and use the current values".
+var configFallbackSent = false;
+
+// Identifies the reload request in flight. The reply callback closes over the id
+// of its own request, so a late reply cannot complete a newer request's wait.
+var configRequestId = 0;
 
 // A deferred press is being replayed right now.
 var replaying = false;
@@ -220,7 +234,9 @@ function readBool(key, fallback) {
         if (lower === "false" || lower === "off" || lower === "no" || lower === "0") {
             return false;
         }
-        return !!value;
+        // Not a spelling this script knows: a hand-edited kwinrc then means the
+        // default, not "true".
+        return fallback;
     } catch (error) {
         warn("could not read " + key + ": " + error);
         return fallback;
@@ -396,14 +412,14 @@ function currentActiveWindow() {
 
 /**
  * True when readConfig() may still return the values from before the settings
- * dialog was used, so a press has to wait for options.configChanged instead of
- * toggling a window from a stale configuration. Two reasons are tracked
+ * dialog was used, so a press has to wait for the reload to be confirmed instead
+ * of toggling a window from a stale configuration. Two reasons are tracked
  * explicitly: a reload was requested and not confirmed yet, and the dialog was
- * activated since the last reload (onConfigChanged() rebuilds that latch from the
- * active window, so a second Apply while the dialog stays focused is already
- * covered by it). The third check - is a settings window focused right now - is a
- * cheap safety net for an activation that never reached the script; it is not
- * what catches the second Apply.
+ * activated since the last reload (completeConfigReload() rebuilds that latch
+ * from the active window, so a second Apply while the dialog stays focused is
+ * already covered by it). The third check - is a settings window focused right
+ * now - is a cheap safety net for an activation that never reached the script; it
+ * is not what catches the second Apply.
  */
 function configMayBeStale() {
     if (awaitingConfig || settingsWindowSeen) {
@@ -413,9 +429,15 @@ function configMayBeStale() {
 }
 
 /**
- * Asks KWin to re-read kwinrc. KWin coalesces reconfigure requests with its own
- * 200 ms timer, so there is no point in debouncing here; the shared deadline is
- * only about the answer, not about the request.
+ * Asks KWin to re-read kwinrc through its scripting interface, and falls back to
+ * a plain reconfigure when that is not answered (see onConfigTimeout()).
+ *
+ * The primary call is Scripting::start(): in KWin 6.8 it reparses kwinrc
+ * synchronously inside the call (Scripting::queryScriptsToLoad()), so its reply is
+ * a deterministic "the configuration is fresh now" moment instead of a guess. It
+ * does not re-evaluate the window rules of every window the way
+ * Workspace::slotReconfigure() does, and it does not restart this script either:
+ * Script::run() returns immediately for an already running script.
  *
  * Returns true when a deferred press may wait: a reload is pending and the shared
  * deadline is really ticking, so something will end the wait even if the answer
@@ -438,22 +460,32 @@ function requestConfigReload() {
         // only ever set together with an armed deadline - so it is a backstop
         // that keeps a future change from leaving a latch that eats requests.
         awaitingConfig = false;
+        configFallbackSent = false;
     }
     awaitingConfig = true;
+    configFallbackSent = false;
+    configRequestId += 1;
+    var requestId = configRequestId;
     armConfigTimer();
     if (!configTimerArmed) {
-        // The request is still worth sending - options.configChanged may arrive -
-        // but nothing here can end the wait, so no latch is kept.
+        // The request is still worth sending - the reply or
+        // options.configChanged may arrive - but nothing here can end the wait,
+        // so no latch is kept.
         awaitingConfig = false;
     }
-    // The try/catch only guards the JS call itself: Script::callDBus() never
-    // throws and silently drops error replies, so a failed reconfigure is
-    // invisible here. The deadline armed above is what unsticks it, when one
-    // could be armed at all.
+    // Script::callDBus() takes the last callable argument as the reply callback
+    // and drops it for an error reply: it logs "Received D-Bus message is error"
+    // to kwin_scripting and never calls the function. On a KWin without this
+    // method the callback is therefore never reached, and the deadline armed
+    // above is what unsticks it by falling back to reconfigure.
     try {
-        callDBus("org.kde.KWin", "/KWin", "org.kde.KWin", "reconfigure");
+        callDBus("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "start",
+                 function () {
+                     onConfigReply(requestId);
+                 });
     } catch (error) {
         awaitingConfig = false;
+        configFallbackSent = false;
         stopConfigTimer();
         warn("could not ask KWin to reload its configuration: " + error);
         // No reload is pending any more, so a deferred press has nothing left to
@@ -461,8 +493,28 @@ function requestConfigReload() {
         return false;
     }
     // The request survived, but waiting still needs a deadline: without one only
-    // options.configChanged could end the wait, and it may never come.
+    // the reply or options.configChanged could end the wait, and neither may
+    // ever come.
     return configTimerArmed;
+}
+
+/**
+ * Sends the reconfigure call that works on every KWin, the fallback of
+ * onConfigTimeout() when the scripting interface did not answer. Its answer is
+ * options.configChanged, like any other reconfigure, so nothing here waits for
+ * the call itself.
+ *
+ * Returns false when the call threw, which only a JavaScript-level failure does:
+ * Script::callDBus() never throws for a D-Bus error.
+ */
+function requestReconfigureFallback() {
+    try {
+        callDBus("org.kde.KWin", "/KWin", "org.kde.KWin", "reconfigure");
+        return true;
+    } catch (error) {
+        warn("could not ask KWin to reload its configuration: " + error);
+        return false;
+    }
 }
 
 /**
@@ -602,29 +654,57 @@ function replayPendingPresses() {
 }
 
 /**
- * options.configChanged arrived, so readConfig() now returns the new values.
+ * The configuration is fresh now - the scripting call replied, or
+ * options.configChanged arrived - so this is the moment to recompile the slots,
+ * to stop the deadline and to replay whatever was queued for the new values.
  *
- * Any such signal counts as confirmation of our own request, whichever
- * reconfigure triggered it: the KWin config cache is reparsed before the signal
- * is emitted, so readConfig() is already fresh here and no "is this our reload?"
- * bookkeeping is needed.
+ * Both events mean the same thing and both run this, which is what keeps them
+ * idempotent when the same reload is announced twice: applyConfig() is a no-op
+ * for an unchanged signature, the second call finds no armed deadline left, and
+ * replayPendingPresses() clears the queue before touching it, so the presses are
+ * replayed once. "The dialog was used since the last reload" is rebuilt rather
+ * than cleared, so a second arrival cannot lose a latch the first one set.
  */
-function onConfigChanged() {
+function completeConfigReload() {
     try {
         applyConfig();
     } catch (error) {
         warn("failed to apply configuration: " + error);
     }
     awaitingConfig = false;
-    // After a reload "the dialog was used since the last reload" is rebuilt from
-    // the active window instead of being cleared unconditionally: with a settings
-    // window still focused the flag only means "the dialog is still up, so another
-    // Apply may still come". With a normal window focused it becomes false, which
-    // keeps the flag self-healing when the dialog was closed without any window
-    // becoming active afterwards.
+    configFallbackSent = false;
+    // With a settings window still focused the flag only means "the dialog is
+    // still up, so another Apply may still come". With a normal window focused it
+    // becomes false, which keeps the flag self-healing when the dialog was closed
+    // without any window becoming active afterwards.
     settingsWindowSeen = isSettingsWindow(currentActiveWindow());
     stopConfigTimer();
     replayPendingPresses();
+}
+
+/**
+ * The scripting interface replied. KWin reparsed kwinrc inside that call, so
+ * readConfig() is already fresh here; nothing is inferred. The request id keeps a
+ * late reply of an older request from completing the wait of a newer one, which
+ * would replay the queued presses against a configuration that may still be the
+ * old one.
+ */
+function onConfigReply(requestId) {
+    if (requestId !== configRequestId) {
+        return;
+    }
+    completeConfigReload();
+}
+
+/**
+ * options.configChanged arrived, so readConfig() now returns the new values.
+ *
+ * Any such signal counts as confirmation, whichever reconfigure triggered it: the
+ * KWin config cache is reparsed before the signal is emitted, so readConfig() is
+ * already fresh here and no "is this our reload?" bookkeeping is needed.
+ */
+function onConfigChanged() {
+    completeConfigReload();
 }
 
 /**
@@ -646,16 +726,45 @@ function rereadConfigAndReplay() {
 }
 
 /**
- * The deadline expired without options.configChanged. Clearing awaitingConfig
- * keeps the reload request path alive instead of ignoring every later request,
- * and the queued presses are replayed so that no keypress is lost. The single
- * warning is the one report of the stuck reload; nothing else logs about it.
+ * The deadline expired without an answer. It has two stages, one warning each and
+ * the fallback exactly once per request:
+ *
+ * The first expiry means the scripting call was not answered - an older KWin
+ * without that method drops the error reply, so the callback never comes. The
+ * reconfigure call, which works everywhere, is sent once and the deadline is
+ * re-armed to give its options.configChanged a chance to arrive; KWin coalesces
+ * reconfigure requests with its own 200 ms timer, so the request itself is not
+ * debounced here.
+ *
+ * The second expiry means the fallback did not answer either. The current values
+ * are then the best ones available: the latch is cleared (otherwise one
+ * unanswered request would ignore every later one), one line is written, and the
+ * configuration is re-read and the queued presses replayed once more. A press is
+ * therefore never lost because KWin stayed silent.
  */
 function onConfigTimeout() {
     // The single-shot timer stopped itself before this handler ran.
     configTimerArmed = false;
-    if (awaitingConfig) {
+    if (awaitingConfig && !configFallbackSent) {
+        configFallbackSent = true;
+        // One line per request, not one per expired deadline: a press re-arms the
+        // same deadline without asking for a new fallback.
+        warn("KWin did not answer the script reload request, falling back to reconfigure");
+        if (requestReconfigureFallback()) {
+            armConfigTimer();
+            if (configTimerArmed) {
+                // The fallback answers through options.configChanged, so waiting is
+                // safe; the next expiry is what ends it if that never arrives.
+                return;
+            }
+        }
+        // The fallback could not be sent or has no deadline to be waited for, so
+        // finish with the values that are available instead of waiting forever.
         awaitingConfig = false;
+        configFallbackSent = false;
+    } else if (awaitingConfig) {
+        awaitingConfig = false;
+        configFallbackSent = false;
         warn("KWin did not confirm the configuration reload, using the current values");
     }
     if (!hasPendingPresses()) {
@@ -716,12 +825,12 @@ function isRelevant(client, index) {
 
 /**
  * configIsFresh is true when readConfig() is known to return the current values,
- * i.e. for a press that is replayed after options.configChanged.
+ * i.e. for a press that is replayed after the configuration was reloaded.
  */
 function toggleWindow(index, configIsFresh) {
     if (!configIsFresh && configMayBeStale()) {
-        // readConfig() still holds the old values, so the press waits for
-        // options.configChanged instead of toggling a stale window.
+        // readConfig() still holds the old values, so the press is queued instead
+        // of toggling a stale window.
         notePendingPress(index);
         if (requestConfigReload()) {
             return;
