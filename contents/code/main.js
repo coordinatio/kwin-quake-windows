@@ -27,10 +27,7 @@
 
 var SLOT_COUNT = 7;
 
-// Upper bound for the queue of hotkey presses waiting for a fresh configuration.
-var MAX_PENDING_TOGGLES = 8;
-
-// If KWin never confirms the reload, replay the queued presses after this delay.
+// If KWin never confirms the reload, replay the pending presses after this delay.
 var SAFETY_TIMEOUT_MS = 1000;
 
 // A reload request that stays unanswered must not block the next one forever.
@@ -42,7 +39,10 @@ var CONFIG_WATCHDOG_MS = 2000;
 var SETTINGS_APP_CLASSES = ["systemsettings", "plasma-systemsettings", "plasma-settings", "kcmshell"];
 
 var slotRegex = [];
-var activeSlotCount = 0;
+
+// Slot indices (0-based) that have a compiled expression.
+var activeSlots = [];
+
 var configSignature = null;
 
 // A settings window was activated since the last reload attempt.
@@ -51,13 +51,16 @@ var settingsWindowSeen = false;
 // A reconfigure was requested and options.configChanged has not arrived yet.
 var awaitingConfig = false;
 
-// A queued press is being replayed right now.
+// A deferred press is being replayed right now.
 var replaying = false;
 
-// Slot indices whose hotkey was pressed while the configuration was stale.
-var pendingToggles = [];
+// Slot indices whose hotkey was pressed an odd number of times while the
+// configuration was stale. Toggling is parity-sensitive: two presses restore the
+// original state, so counting them per slot beats queueing them, and the memory
+// is bounded by SLOT_COUNT.
+var pendingPresses = [];
 
-// Single-shot safety net for the queue above, created lazily.
+// Single-shot safety net for the presses above, created lazily.
 var pendingToggleTimer = null;
 
 // Single-shot watchdog for an unanswered reload request, created lazily.
@@ -156,27 +159,27 @@ function compilePattern(pattern, index) {
 }
 
 /**
- * Re-reads the seven slots. Returns true when the stored configuration changed,
- * in which case the regular expressions have been recompiled.
+ * Re-reads the seven slots and recompiles them when the stored values changed.
  */
 function applyConfig() {
     var raw = readRawSlots();
     var signature = JSON.stringify(raw);
     if (signature === configSignature) {
-        return false;
+        return;
     }
     configSignature = signature;
 
     var active = [];
+    var sources = [];
     for (var index = 0; index < SLOT_COUNT; ++index) {
         slotRegex[index] = raw[index].enabled ? compilePattern(raw[index].pattern, index) : null;
         if (slotRegex[index]) {
-            active.push((index + 1) + ": " + slotRegex[index].source);
+            active.push(index);
+            sources.push((index + 1) + ": " + slotRegex[index].source);
         }
     }
-    activeSlotCount = active.length;
-    info("active slots: " + (active.length ? active.join(", ") : "none"));
-    return true;
+    activeSlots = active;
+    info("active slots: " + (sources.length ? sources.join(", ") : "none"));
 }
 
 function windowClass(client) {
@@ -289,13 +292,11 @@ function safetyTimer() {
     return pendingToggleTimer;
 }
 
-function queuePendingToggle(index) {
-    if (pendingToggles.length >= MAX_PENDING_TOGGLES) {
-        // Dropping a press is better than unbounded growth, but never silent.
-        warn("the queue of pending toggles is full, dropping the oldest queued toggle");
-        pendingToggles.shift();
-    }
-    pendingToggles.push(index);
+function notePendingPress(index) {
+    // Toggling is parity-sensitive, so remember only whether the number of
+    // presses for this slot is odd. Dropping presses of a bounded queue could
+    // leave the window in the opposite state.
+    pendingPresses[index] = !pendingPresses[index];
 
     var timer = safetyTimer();
     if (!timer) {
@@ -308,22 +309,36 @@ function queuePendingToggle(index) {
     }
 }
 
-function replayPendingToggles() {
-    if (!pendingToggles.length) {
+function hasPendingPresses() {
+    for (var index = 0; index < SLOT_COUNT; ++index) {
+        if (pendingPresses[index]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function replayPendingPresses() {
+    if (!hasPendingPresses()) {
         return;
     }
-    var queued = pendingToggles;
-    pendingToggles = [];
+    var pressed = pendingPresses;
+    // Cleared before replaying, so a toggle that re-enters this path sees an
+    // empty state instead of replaying the same presses again.
+    pendingPresses = [];
     // Toggling a hidden window activates it, which fires windowActivated. The
     // configuration was just reloaded, so such an activation must not request
     // another reload.
     replaying = true;
     try {
-        for (var i = 0; i < queued.length; ++i) {
+        for (var index = 0; index < SLOT_COUNT; ++index) {
+            if (!pressed[index]) {
+                continue;
+            }
             try {
-                toggleWindow(queued[i], true);
+                toggleWindow(index, true);
             } catch (error) {
-                warn("failed to replay toggle of window " + (queued[i] + 1) + ": " + error);
+                warn("failed to replay toggle of window " + (index + 1) + ": " + error);
             }
         }
     } finally {
@@ -349,19 +364,27 @@ function onConfigChanged() {
             warn("could not stop the pending toggle timer: " + error);
         }
     }
-    replayPendingToggles();
+    replayPendingPresses();
 }
 
 /**
  * KWin did not confirm the reload in time: a hotkey press must never be lost.
  */
 function onPendingToggleTimeout() {
-    if (!pendingToggles.length) {
+    if (!hasPendingPresses()) {
         return;
     }
-    warn("KWin did not confirm the configuration reload, applying the queued toggle(s) anyway");
+    warn("KWin did not confirm the configuration reload, applying the pending toggle(s) anyway");
     awaitingConfig = false;
-    replayPendingToggles();
+    // Best effort: if KWin reparsed kwinrc but the configChanged signal was lost,
+    // this picks the fresh values up. When nothing changed, applyConfig() is a
+    // no-op thanks to the signature check.
+    try {
+        applyConfig();
+    } catch (error) {
+        warn("failed to apply configuration: " + error);
+    }
+    replayPendingPresses();
 }
 
 /**
@@ -407,7 +430,7 @@ function toggleWindow(index, configIsFresh) {
     if (!configIsFresh && (awaitingConfig || settingsWindowSeen)) {
         // The dialog was used and readConfig() still holds the old values, so the
         // press waits for options.configChanged instead of toggling a stale window.
-        queuePendingToggle(index);
+        notePendingPress(index);
         requestConfigReload();
         return;
     }
@@ -419,10 +442,12 @@ function toggleWindow(index, configIsFresh) {
     }
 
     var allClients = workspace.windowList();
+    var matched = false;
     for (var i = 0; i < allClients.length; ++i) {
         if (!isRelevant(allClients[i], index)) {
             continue;
         }
+        matched = true;
         var prevMini = allClients[i].minimized;
         allClients[i].onAllDesktops = !prevMini;
         allClients[i].minimized = !prevMini;
@@ -434,10 +459,14 @@ function toggleWindow(index, configIsFresh) {
         }
         break; // only toggle one window
     }
+    if (!matched) {
+        // The expression is valid, so a typo in it is the likely cause.
+        info("no window matches slot " + (index + 1));
+    }
 }
 
-function onCurrentDesktopChanged(oldDesktop, previousDesktop) {
-    if (!activeSlotCount) {
+function onCurrentDesktopChanged(previousDesktop, newDesktop) {
+    if (!activeSlots.length) {
         // No slot has a usable expression, skip the window scan.
         return;
     }
@@ -445,9 +474,12 @@ function onCurrentDesktopChanged(oldDesktop, previousDesktop) {
     // on the taskbar on desktop change.
     var allClients = workspace.windowList();
     for (var i = 0; i < allClients.length; ++i) {
-        for (var index = 0; index < SLOT_COUNT; ++index) {
-            if (isRelevant(allClients[i], index)) {
+        for (var j = 0; j < activeSlots.length; ++j) {
+            if (isRelevant(allClients[i], activeSlots[j])) {
+                // Assigning the same value twice is pointless, so the first
+                // matching slot decides for this window.
                 allClients[i].skipTaskbar = allClients[i].minimized;
+                break;
             }
         }
     }
@@ -463,9 +495,9 @@ function makeToggleHandler(index) {
     };
 }
 
-function handleCurrentDesktopChanged(oldDesktop, newDesktop) {
+function handleCurrentDesktopChanged(previousDesktop, newDesktop) {
     try {
-        onCurrentDesktopChanged(oldDesktop, newDesktop);
+        onCurrentDesktopChanged(previousDesktop, newDesktop);
     } catch (error) {
         warn("failed to handle a desktop change: " + error);
     }
@@ -508,7 +540,11 @@ function init() {
         return;
     }
 
-    applyConfig();
+    try {
+        applyConfig();
+    } catch (error) {
+        warn("failed to apply configuration: " + error);
+    }
 
     for (var index = 0; index < SLOT_COUNT; ++index) {
         try {

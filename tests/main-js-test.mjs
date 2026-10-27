@@ -11,10 +11,14 @@
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SOURCE_PATH = fileURLToPath(new URL('../contents/code/main.js', import.meta.url));
+const MAIN_XML_PATH = path.join(REPO_ROOT, 'contents/config/main.xml');
+const CONFIG_UI_PATH = path.join(REPO_ROOT, 'contents/ui/config.ui');
 const SOURCE = fs.readFileSync(SOURCE_PATH, 'utf8');
 
 let failures = 0;
@@ -45,7 +49,11 @@ class MockTimer {
             this.interval = ms;
         }
         this.running = true;
-        harness.timers.push(this);
+        // Restarting a timer must not add a second entry: the tests count the
+        // timer objects that were created, not the start() calls.
+        if (!harness.timers.includes(this)) {
+            harness.timers.push(this);
+        }
     }
     stop() {
         this.running = false;
@@ -124,7 +132,6 @@ function createContext(state) {
             },
         },
     };
-    context.workspace.__config = config;
     return { context, config };
 }
 
@@ -140,8 +147,17 @@ function load(state) {
     reset();
     const { context, config } = createContext(state);
     vm.createContext(context);
+    if (state.throwInApplyConfig) {
+        // Every readConfig() access inside applyConfig() is guarded, so poisoning
+        // JSON.stringify is the only remaining way to make it throw. The guard in
+        // init() is what has to survive that.
+        context.JSON = {
+            stringify() {
+                throw new Error('poisoned JSON');
+            },
+        };
+    }
     vm.runInContext(SOURCE, context, { filename: 'main.js' });
-    harness.context = context;
     return { context, config };
 }
 
@@ -175,6 +191,18 @@ function emitConfigChanged(context) {
     context.options.configChanged.fns.forEach((fn) => fn());
 }
 
+// The parity state is an array of undefined/true entries; the tests only care
+// about which slots are pending.
+function pendingIndexes(context) {
+    const pending = [];
+    for (let index = 0; index < context.SLOT_COUNT; ++index) {
+        if (context.pendingPresses[index]) {
+            pending.push(index);
+        }
+    }
+    return pending;
+}
+
 // ================================================================= 1. registration
 {
     const { context } = load({ windows: [] });
@@ -202,6 +230,32 @@ function emitConfigChanged(context) {
         assert.equal(harness.warnings.length, 0);
         assert.match(harness.infos.join('\n'), /active slots: none/);
     }, 'unconfigured slots are inactive and no reconfigure is requested on startup');
+}
+
+// ================================= 1b. applyConfig() failing during init() (finding 1)
+{
+    const { context } = load({ WindowName1: '^quake$', throwInApplyConfig: true });
+
+    check(() => {
+        assert.match(harness.warnings.join('\n'), /failed to apply configuration: .*poisoned JSON/);
+        assert.equal(harness.shortcuts.length, 7, 'the shortcuts are registered anyway');
+        assert.equal(context.workspace.currentDesktopChanged.fns.length, 1,
+            'currentDesktopChanged is connected anyway');
+        assert.equal(context.workspace.windowActivated.fns.length, 1,
+            'windowActivated is connected anyway');
+        assert.equal(context.options.configChanged.fns.length, 1,
+            'options.configChanged is connected anyway');
+        assert.equal(context.initialized, true, 'init() still completes');
+    }, 'a failing applyConfig() during init() is caught and does not stop the setup');
+
+    check(() => {
+        assert.doesNotThrow(() => harness.shortcuts[0].callback(),
+            'a press on the unusable slot does not escape into KWin');
+        assert.match(harness.infos.join('\n'), /slot 1 is disabled or has no valid expression/);
+        assert.doesNotThrow(() => emitConfigChanged(context),
+            'a configuration change does not escape into KWin');
+        assert.match(harness.warnings.join('\n'), /failed to apply configuration/);
+    }, 'after the failed init the script stays inert but guarded');
 }
 
 // ====================================================== 2. matching / enabled flags
@@ -268,8 +322,55 @@ function emitConfigChanged(context) {
     check(() => {
         // Nothing toggled above, so the configuration never became stale.
         assert.equal(reconfigureCalls().length, 0);
-        assert.equal(context.pendingToggles.length, 0);
+        assert.deepEqual(pendingIndexes(context), []);
     }, 'pressing an inactive slot does not request a configuration reload');
+}
+
+// ======================================= 2b. a slot matching nothing (finding 5)
+{
+    const window1 = makeWindow('something else');
+    load({ WindowName1: '^typo$', windows: [window1] });
+
+    check(() => {
+        const before = harness.infos.length;
+        harness.shortcuts[0].callback();
+        const logged = harness.infos.slice(before).join('\n');
+        assert.match(logged, /no window matches slot 1/);
+        assert.equal(window1.minimized, false, 'nothing was toggled');
+        assert.equal(reconfigureCalls().length, 0,
+            'a valid expression never requests a reload');
+    }, 'a slot with a valid expression that matches nothing logs one info line');
+}
+
+// ===================================================== 2c. readBool string coercion
+{
+    const window1 = makeWindow('quake');
+    load({
+        Enabled1: 'false', WindowName1: 'quake',
+        Enabled2: '0', WindowName2: 'quake',
+        Enabled3: 'true', WindowName3: 'quake',
+        Enabled4: '1', WindowName4: 'quake',
+        windows: [window1],
+    });
+
+    check(() => {
+        const active = harness.infos.join('\n');
+        assert.match(active, /3: quake/);
+        assert.match(active, /4: quake/);
+        assert.doesNotMatch(active, /1: quake/);
+        assert.doesNotMatch(active, /2: quake/);
+    }, 'the strings "false" and "0" disable a slot, "true" and "1" enable it');
+
+    check(() => {
+        harness.shortcuts[0].callback();
+        harness.shortcuts[1].callback();
+        assert.equal(window1.minimized, false, 'the disabled slots did not toggle');
+        const logged = harness.infos.join('\n');
+        assert.match(logged, /slot 1 is disabled or has no valid expression/);
+        assert.match(logged, /slot 2 is disabled or has no valid expression/);
+        harness.shortcuts[2].callback();
+        assert.equal(window1.minimized, true, 'the slot enabled by "true" toggles');
+    }, 'a slot disabled by the string "false" or "0" never toggles');
 }
 
 // ============================================ 3. pattern compilation edge cases
@@ -390,7 +491,7 @@ function emitConfigChanged(context) {
         harness.shortcuts[0].callback();
         assert.equal(window1.minimized, false, 'the stale window is not toggled');
         assert.equal(second.minimized, false);
-        assert.deepEqual([...context.pendingToggles], [0], 'the press was queued');
+        assert.deepEqual(pendingIndexes(context), [0], 'the press is pending');
         assert.equal(reconfigureCalls().length, 1, 'the press requests a reload itself');
         const timer = safetyTimer(context);
         assert.equal(timer.singleShot, true);
@@ -401,11 +502,11 @@ function emitConfigChanged(context) {
     check(() => {
         config.WindowName1 = '^second window$';
         emitConfigChanged(context);
-        assert.equal(context.pendingToggles.length, 0, 'the queue is drained');
+        assert.deepEqual(pendingIndexes(context), [], 'no press is pending any more');
         assert.equal(safetyTimer(context).running, false, 'the safety net is stopped');
         assert.equal(second.minimized, true, 'the replayed press used the fresh expression');
         assert.equal(window1.minimized, false, 'the old expression was not used');
-    }, 'options.configChanged replays the queued press with the fresh configuration');
+    }, 'options.configChanged replays the pending press with the fresh configuration');
 
     check(() => {
         // Focus left the dialog (as it does in real use) and the reload completed.
@@ -417,41 +518,32 @@ function emitConfigChanged(context) {
 
         harness.shortcuts[0].callback();
         assert.equal(second.minimized, false, 'the press toggles back synchronously');
-        assert.equal(context.pendingToggles.length, 0, 'nothing is queued when the config is fresh');
+        assert.deepEqual(pendingIndexes(context), [], 'nothing is pending when the config is fresh');
     }, 'after the replay a press with a fresh configuration toggles synchronously');
 
     check(() => {
-        // A press that arrives while a reload is already pending joins the queue
-        // without sending a second D-Bus call.
+        // A press that arrives while a reload is already pending is folded into the
+        // parity flag without sending a second D-Bus call.
         const before = reconfigureCalls().length;
         activate(context, settingsWindow());
         activate(context, window1);              // focus loss -> reconfigure #before+1
         assert.equal(reconfigureCalls().length, before + 1);
         assert.equal(context.awaitingConfig, true);
         harness.shortcuts[1].callback();          // press while awaitingConfig
+        assert.deepEqual(pendingIndexes(context), [1], 'one press is pending for slot 2');
         harness.shortcuts[1].callback();          // and once more
         assert.equal(reconfigureCalls().length, before + 1,
             'the pending reload is reused instead of being requested again');
-        assert.deepEqual([...context.pendingToggles], [1, 1], 'both presses are queued in order');
+        assert.deepEqual(pendingIndexes(context), [], 'two presses cancel out per slot');
         const target = makeWindow('third title');
         context.workspace.windows = [window1, second, target];
         config.WindowName2 = '^third title$';
         emitConfigChanged(context);
-        assert.equal(context.pendingToggles.length, 0);
-        assert.equal(target.minimized, false, 'two presses cancel out per slot');
+        assert.equal(target.minimized, false, 'two presses toggle nothing');
         assert.equal(context.awaitingConfig, false);
-    }, 'presses arriving during a pending reload are queued and replayed in order');
-
-    check(() => {
-        // Queue cap: never grow beyond 8 entries.
-        activate(context, settingsWindow());
-        for (let i = 0; i < 12; ++i) {
-            harness.shortcuts[2].callback();
-        }
-        assert.equal(context.pendingToggles.length, 8, 'the queue is capped at 8 entries');
-        emitConfigChanged(context);
-        assert.equal(context.pendingToggles.length, 0);
-    }, 'the queue of pending presses is capped at 8 entries');
+        safetyTimer(context).fire();
+        assert.equal(target.minimized, false, 'a stale safety timer replays nothing');
+    }, 'presses arriving during a pending reload are counted per slot, not queued');
 }
 
 // ======================================= 5b. a replay must not reload again (finding 1)
@@ -463,14 +555,14 @@ function emitConfigChanged(context) {
     check(() => {
         activate(context, settingsWindow());
         harness.shortcuts[0].callback();
-        assert.equal(window1.minimized, true, 'the press is queued, not toggled');
-        assert.deepEqual([...context.pendingToggles], [0]);
+        assert.equal(window1.minimized, true, 'the press is deferred, not toggled');
+        assert.deepEqual(pendingIndexes(context), [0]);
         assert.equal(reconfigureCalls().length, 1);
 
         // configChanged arrives while the dialog is still focused: the replay
         // restores the window, which activates it.
         emitConfigChanged(context);
-        assert.equal(window1.minimized, false, 'the queued press restored the window');
+        assert.equal(window1.minimized, false, 'the pending press restored the window');
         assert.equal(reconfigureCalls().length, 1,
             'replaying a press must not request another reload');
         assert.equal(context.awaitingConfig, false);
@@ -484,7 +576,7 @@ function emitConfigChanged(context) {
         // dialog is noticed on the next press.
         harness.shortcuts[0].callback();
         assert.equal(window1.minimized, false, 'the press is deferred again');
-        assert.deepEqual([...context.pendingToggles], [0]);
+        assert.deepEqual(pendingIndexes(context), [0]);
         assert.equal(reconfigureCalls().length, 2, 'and it asks for a reload');
         assert.equal(context.awaitingConfig, true);
     }, 'a second Apply is still detected while the dialog stays focused');
@@ -521,7 +613,7 @@ function emitConfigChanged(context) {
         // A later press must not wait for the 1 s safety timeout any more.
         harness.shortcuts[0].callback();
         assert.equal(window1.minimized, true, 'the press toggles immediately');
-        assert.equal(context.pendingToggles.length, 0, 'nothing is queued');
+        assert.deepEqual(pendingIndexes(context), [], 'nothing is pending');
         assert.equal(context.pendingToggleTimer, null, 'no safety timer was armed');
         assert.equal(reconfigureCalls().length, 1, 'no extra reload request');
     }, 'after the watchdog a press is not delayed by the safety timeout');
@@ -589,55 +681,102 @@ function emitConfigChanged(context) {
 // ======================================================== 9. safety-timeout replay
 {
     const window1 = makeWindow('first title');
-    const { context, config } = load({ WindowName1: 'first title', windows: [window1] });
+    const { context, config } = load({ WindowName1: '^first title$', windows: [window1] });
 
     check(() => {
-        config.WindowName1 = '^renamed$';
         activate(context, settingsWindow());
         harness.shortcuts[0].callback();
-        assert.equal(window1.minimized, false);
+        assert.equal(window1.minimized, false, 'the press is deferred');
+        assert.deepEqual(pendingIndexes(context), [0]);
+
+        // KWin reparsed kwinrc but the configChanged signal was lost: only now,
+        // after the timer is armed, does readConfig() start returning new values.
+        const renamed = makeWindow('renamed');
+        context.workspace.windows = [window1, renamed];
+        config.WindowName1 = '^renamed$';
 
         const warningsBefore = harness.warnings.length;
         safetyTimer(context).fire();  // KWin never sends configChanged
         assert.equal(harness.warnings.length, warningsBefore + 1, 'one warning is logged');
         assert.match(harness.warnings[harness.warnings.length - 1], /did not confirm the configuration reload/);
-        assert.equal(context.pendingToggles.length, 0, 'the queue is drained');
+        assert.deepEqual(pendingIndexes(context), [], 'no press is pending any more');
         assert.equal(context.awaitingConfig, false, 'the state machine is unstuck');
-        assert.equal(window1.minimized, true, 'the press is not lost and toggles the window');
-    }, 'the safety timeout replays a queued press when configChanged never arrives');
+        assert.equal(renamed.minimized, true, 'the replayed press used the re-read expression');
+        assert.equal(window1.minimized, false, 'the old expression was not used');
+    }, 'the safety timeout re-reads the configuration and replays the pending press');
 
     check(() => {
         // A late configChanged must not toggle the same press twice.
         emitConfigChanged(context);
-        assert.equal(window1.minimized, true, 'no double toggle after the timeout');
-        assert.equal(context.pendingToggles.length, 0);
-        assert.match(harness.infos.join('\n'), /active slots: none|1:/);
+        assert.equal(context.workspace.windows[1].minimized, true, 'no double toggle after the timeout');
+        assert.deepEqual(pendingIndexes(context), []);
+        assert.match(harness.infos.join('\n'), /active slots: 1: \^renamed\$/);
     }, 'a late configChanged after the timeout does not toggle twice');
 
     check(() => {
-        // An empty queue on timeout is a no-op and must not warn.
+        // Nothing pending on timeout is a no-op: no warning, no re-read.
         const warningsBefore = harness.warnings.length;
+        const infosBefore = harness.infos.length;
         safetyTimer(context).fire();
         assert.equal(harness.warnings.length, warningsBefore);
-    }, 'an empty queue on the safety timeout does nothing');
+        assert.equal(harness.infos.length, infosBefore, 'the configuration is not re-read');
+    }, 'an empty pending set on the safety timeout does nothing');
 }
 
-// ========================================================= 10. dropped queued press
+// =============================================== 10. per-slot press parity (finding 4)
 {
-    const { context } = load({ WindowName1: 'anything', windows: [] });
-
+    // Toggling is parity-sensitive, so the deferred presses are counted per slot
+    // instead of being queued: dropping any of them would invert the result.
+    const single = makeWindow('quake');
+    const odd = load({ WindowName1: '^quake$', windows: [single] });
     check(() => {
-        activate(context, settingsWindow());
-        const before = harness.warnings.length;
-        for (let i = 0; i < 9; ++i) {
+        activate(odd.context, settingsWindow());
+        harness.shortcuts[0].callback();
+        assert.deepEqual(pendingIndexes(odd.context), [0], 'one press is pending');
+        emitConfigChanged(odd.context);
+        assert.deepEqual(pendingIndexes(odd.context), [], 'the pending press was replayed');
+        assert.equal(single.minimized, true, 'one press toggles the window exactly once');
+    }, 'a single pending press toggles the window once');
+
+    const pairWindow = makeWindow('quake');
+    const even = load({ WindowName1: '^quake$', windows: [pairWindow] });
+    check(() => {
+        activate(even.context, settingsWindow());
+        harness.shortcuts[0].callback();
+        harness.shortcuts[0].callback();
+        assert.deepEqual(pendingIndexes(even.context), [], 'two presses cancel out');
+        emitConfigChanged(even.context);
+        assert.equal(pairWindow.minimized, false, 'two presses leave the window untouched');
+        assert.equal(even.context.pendingToggleTimer.running, false, 'the safety net is stopped');
+    }, 'two pending presses cancel out and toggle nothing');
+
+    const tripleWindow = makeWindow('quake');
+    const triple = load({ WindowName1: '^quake$', windows: [tripleWindow] });
+    check(() => {
+        activate(triple.context, settingsWindow());
+        for (let i = 0; i < 3; ++i) {
             harness.shortcuts[0].callback();
         }
-        assert.equal(context.pendingToggles.length, 8, 'the cap stays at 8');
-        const logged = harness.warnings.slice(before);
-        assert.equal(logged.length, 1, 'dropping the oldest press warns exactly once');
-        assert.match(logged[0], /queue of pending toggles is full/);
-        assert.match(logged[0], /dropping the oldest/);
-    }, 'a queued press dropped by the cap is reported with a warning');
+        assert.deepEqual(pendingIndexes(triple.context), [0], 'three presses leave one');
+        emitConfigChanged(triple.context);
+        assert.equal(tripleWindow.minimized, true, 'three presses toggle the window once');
+        assert.equal(harness.warnings.length, 0, 'nothing warns about a full queue any more');
+    }, 'three pending presses toggle the window exactly once');
+
+    // Presses on different slots are independent, so their order does not matter.
+    const first = makeWindow('quake');
+    const chat = makeWindow('chat');
+    const mixed = load({ WindowName1: '^quake$', WindowName2: '^chat$', windows: [first, chat] });
+    check(() => {
+        activate(mixed.context, settingsWindow());
+        for (const slot of [0, 1, 0, 1, 0]) {
+            harness.shortcuts[slot].callback();
+        }
+        assert.deepEqual(pendingIndexes(mixed.context), [0], 'only slot 1 has an odd count');
+        emitConfigChanged(mixed.context);
+        assert.equal(first.minimized, true, 'slot 1 toggled once');
+        assert.equal(chat.minimized, false, 'slot 2 toggled twice, i.e. never');
+    }, 'presses on different slots are independent of their order');
 }
 
 // ============================================== 11. which windows are settings windows
@@ -655,6 +794,13 @@ function emitConfigChanged(context) {
         activate(context, makeWindow('Settings', { resourceClass: 'plasma-settings-helper' }));
         assert.equal(context.settingsWindowSeen, false, 'a look-alike class name is not one');
     }, 'plasma-settings and the whole kcmshell family are recognised, look-alikes are not');
+
+    check(() => {
+        const { context } = load({ windows: [] });
+        activate(context, makeWindow('Settings', { resourceClass: '', resourceName: 'systemsettings' }));
+        assert.equal(context.settingsWindowSeen, true,
+            'an empty resourceClass falls back to resourceName');
+    }, 'resourceName is used when resourceClass is empty');
 }
 
 // ========================================================= 12. desktop switch fixup
@@ -690,6 +836,59 @@ function emitConfigChanged(context) {
             'no window scan when no slot is active');
         assert.equal(harness.warnings.length, 0);
     }, 'without an active slot the desktop-change handler returns before scanning the windows');
+
+    check(() => {
+        // One window matching two slots: the fixup is idempotent, so skipTaskbar
+        // must be written once per window, not once per matching slot.
+        let writes = 0;
+        const both = makeWindow('quake');
+        both.minimized = true;
+        Object.defineProperty(both, 'skipTaskbar', {
+            get() {
+                return both._skipTaskbar;
+            },
+            set(value) {
+                writes += 1;
+                both._skipTaskbar = value;
+            },
+        });
+        both._skipTaskbar = false;
+        const ctx = load({ WindowName1: 'quake', WindowName2: '^quake$', windows: [both] }).context;
+        ctx.workspace.currentDesktopChanged.fns[0](null, null);
+        assert.equal(writes, 1, 'skipTaskbar is assigned exactly once');
+        assert.equal(both.skipTaskbar, true, 'the hidden window leaves the taskbar');
+    }, 'the desktop-change fixup writes skipTaskbar once for a window matching two slots');
+}
+
+// ============================================ 13. package structure cross-check
+{
+    const mainXml = fs.readFileSync(MAIN_XML_PATH, 'utf8');
+    const configUi = fs.readFileSync(CONFIG_UI_PATH, 'utf8');
+    const entryNames = [...mainXml.matchAll(/<entry\s+name="([^"]+)"/g)].map((match) => match[1]);
+    const widgetNames = [...configUi.matchAll(/<widget[^>]*\bname="kcfg_([^"]+)"/g)]
+        .map((match) => match[1]);
+    const declaredSlots = Number(/var SLOT_COUNT = (\d+);/.exec(SOURCE)[1]);
+
+    check(() => {
+        assert.equal(declaredSlots, 7, 'main.js still declares seven slots');
+        const expected = [];
+        for (let slot = 1; slot <= declaredSlots; ++slot) {
+            expected.push('Enabled' + slot, 'WindowName' + slot);
+        }
+        assert.equal(entryNames.length, 14, 'main.xml declares 14 entries');
+        assert.deepEqual([...entryNames].sort(), [...expected].sort(),
+            'main.xml declares EnabledN and WindowNameN only');
+    }, 'contents/config/main.xml declares exactly 14 entries for seven slots');
+
+    check(() => {
+        assert.equal(widgetNames.length, 14, 'config.ui has 14 kcfg_* widgets');
+        assert.deepEqual([...widgetNames].sort(), [...entryNames].sort(),
+            'every entry has a kcfg_ widget and vice versa');
+        for (let slot = 1; slot <= declaredSlots; ++slot) {
+            assert.ok(widgetNames.includes('Enabled' + slot), 'kcfg_Enabled' + slot + ' exists');
+            assert.ok(widgetNames.includes('WindowName' + slot), 'kcfg_WindowName' + slot + ' exists');
+        }
+    }, 'contents/ui/config.ui mirrors main.xml and SLOT_COUNT one to one');
 }
 
 console.log('');

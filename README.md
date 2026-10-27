@@ -47,13 +47,19 @@ identifiers did not change.
 
 ### Applying changes
 
-Press **Apply** or **OK**. The new values are applied as soon as the configuration window
-loses focus or closes — no need to disable and re-enable the script. If a hotkey is pressed
-before that happens, the press is held back and carried out once the new values have
-arrived; that single press may be delayed by about 200 ms and at most by the 1 s safety
-timeout, because it waits for KWin to re-read `kwinrc`. If KWin does not confirm the reload
-within a second, the queued press is carried out with the previous configuration anyway —
-a keypress is never lost.
+Press **Apply** or **OK**. Closing the Configure dialog only returns focus to System Settings,
+which is itself a settings window, so the script cannot treat that as "the dialog is gone":
+the new values are applied once System Settings itself loses focus, or on the next hotkey
+press. There is no need to disable and re-enable the script.
+
+If a hotkey is pressed before that happens, the press is held back and carried out once the
+new values have arrived; that single press may be delayed by about 200 ms and at most by the
+1 s safety timeout, because it waits for KWin to re-read `kwinrc`. If KWin does not confirm
+the reload within a second, the pending press is carried out anyway after re-reading the
+configuration one last time — a keypress is never lost.
+
+While the Configure dialog stays focused, every press is remembered and asks for a reload;
+KWin coalesces those requests, so at most one reconfigure happens per ~200 ms.
 
 Leaving System Settings triggers one KWin reconfigure even from an unrelated page, and so
 does closing `kcmshell6`: the script cannot tell which configuration module was open. That
@@ -62,6 +68,15 @@ is the price of the generic scripted configuration module not notifying KWin aft
 
 If the change does not arrive (for instance after editing `kwinrc` by hand), toggle the
 script off and on again in *KWin Scripts*.
+
+### How a toggle changes window properties
+
+Toggling does not save and restore the previous values: it always sets `onAllDesktops`,
+`skipTaskbar`, `skipPager` and `skipSwitcher` to `!minimized`. A window that already had
+one of those flags set therefore ends up with the simplified state rather than with what it
+had before. The desktop-change workaround also forces `skipTaskbar = minimized` for every
+window matching a slot, which can override a window rule that asks for something else. Keep
+the expressions narrow when that matters.
 
 ## Manual configuration (legacy)
 
@@ -98,7 +113,11 @@ tools/build-locale.sh                  # compile po/*.po into contents/locale/<l
 ## Tests
 
 `node tests/main-js-test.mjs` runs the logic tests of `contents/code/main.js` against mocked
-KWin globals (plain Node, no dependencies).
+KWin globals (plain Node, no dependencies). It also cross-checks `contents/config/main.xml`,
+`contents/ui/config.ui` and `SLOT_COUNT` against each other.
+
+`python3 tests/ui-test.py` checks the settings form itself with PyQt6 (`QT_QPA_PLATFORM` is
+forced to `offscreen`); it is optional and skips with an explanation when PyQt6 is missing.
 
 ## Credits
 
