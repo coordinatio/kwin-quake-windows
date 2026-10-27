@@ -65,6 +65,10 @@ after the first one. If KWin does not confirm the reload within that time, the p
 presses are carried out anyway after re-reading the configuration one last time — a
 keypress is never lost.
 
+A press that arrives before Apply is replayed with the configuration as it was before that
+Apply: the press happened first, so it is not retroactively applied to the new expression.
+The next press uses the new one.
+
 While the Configure dialog stays focused, every press is remembered and asks for a reload.
 `requestConfigReload()` ignores a request while one is still pending, so presses spaced
 further apart each cost one reconfigure, and KWin itself runs at most one configure pass per
@@ -107,6 +111,9 @@ Previously every slot fell back to the expression `Alacritty`, even slots that w
 configured. An empty slot is now simply inactive. If you relied on that implicit default,
 enter `Alacritty` in the slot explicitly.
 
+Slot matching also requires a non-empty window caption now, so a catch-all pattern such as
+`.*` no longer matches caption-less windows that 2.1 accepted.
+
 Existing `WindowName1` … `WindowName7` values and existing global shortcuts are unchanged.
 
 ## Translations
@@ -130,6 +137,11 @@ their `[ru]` variants.
 
 `python3 tests/ui-test.py` checks the settings form itself with PyQt6 (`QT_QPA_PLATFORM` is
 forced to `offscreen`); it is optional and skips with an explanation when PyQt6 is missing.
+
+`python3 tests/locale-test.py` checks the committed catalogs (Python standard library only):
+every `.pot` msgid must have a Russian translation in `contents/locale/ru/LC_MESSAGES/quakewindows.mo`
+that differs from the English source, the catalog must not hold msgids missing from the
+template, and the version in `metadata.json`, `po/ru.po` and `po/quakewindows.pot` must agree.
 
 ## Credits
 

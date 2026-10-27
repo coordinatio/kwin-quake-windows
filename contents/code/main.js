@@ -124,10 +124,10 @@ function readBool(key, fallback) {
             return value;
         }
         var lower = String(value).toLowerCase();
-        if (lower === "true" || lower === "1") {
+        if (lower === "true" || lower === "on" || lower === "yes" || lower === "1") {
             return true;
         }
-        if (lower === "false" || lower === "0") {
+        if (lower === "false" || lower === "off" || lower === "no" || lower === "0") {
             return false;
         }
         return !!value;
@@ -275,6 +275,9 @@ function requestConfigReload() {
     }
     awaitingConfig = true;
     armConfigWatchdog();
+    // The try/catch only guards the JS call itself: Script::callDBus() never
+    // throws and silently drops error replies, so a failed reconfigure is
+    // invisible here. That is what the watchdog above is for.
     try {
         callDBus("org.kde.KWin", "/KWin", "org.kde.KWin", "reconfigure");
     } catch (error) {
@@ -424,6 +427,12 @@ function replayPendingPresses() {
 
 /**
  * options.configChanged arrived, so readConfig() now returns the new values.
+ *
+ * Any such signal may be treated as confirmation of our own request, whichever
+ * reconfigure triggered it: Workspace::slotReconfigure() always calls
+ * kwinApp()->config()->reparseConfiguration() before Options::updateSettings()
+ * emits the signal, so the KWin config cache is already fresh whenever this
+ * handler runs. No "is this our reload?" bookkeeping is needed.
  */
 function onConfigChanged() {
     try {
