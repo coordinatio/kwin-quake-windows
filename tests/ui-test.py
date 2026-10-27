@@ -31,14 +31,22 @@ MAIN_XML_PATH = os.path.join(REPO_ROOT, "contents", "config", "main.xml")
 SLOTS = 7
 
 failures = []
+checks = 0
 
 
 def check(condition, message):
+    global checks
+    checks += 1
     if not condition:
         failures.append(message)
         print("FAIL:", message)
     else:
         print("ok:  ", message)
+
+
+def summary():
+    """One line with the totals, so a run can be compared with the previous one."""
+    print("\n%d checks, %d failures" % (checks, len(failures)))
 
 
 # ---------------------------------------------------------------- config main.xml
@@ -107,11 +115,10 @@ for slot in range(1, SLOTS + 1):
 try:
     from PyQt6 import QtWidgets, uic
 except ImportError as error:
-    if failures:
-        print("\n%d structural check(s) failed" % len(failures))
     print("\nSKIP: the widget checks need PyQt6, which is not available (%s)." % error)
     print("      Install it with 'python3 -m pip install PyQt6' or your distribution's")
     print("      python3-pyqt6 package. The settings form itself does not need Python.")
+    summary()
     sys.exit(1 if failures else 0)
 
 app = QtWidgets.QApplication(sys.argv)
@@ -149,7 +156,8 @@ for slot in range(1, SLOTS + 1):
     edit.clear()
 
 if failures:
-    print("\n%d check(s) failed" % len(failures))
+    summary()
     sys.exit(1)
 
-print("\nAll UI checks passed.")
+summary()
+print("All UI checks passed.")

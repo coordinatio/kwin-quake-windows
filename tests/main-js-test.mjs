@@ -1184,26 +1184,47 @@ function pendingIndexes(context) {
 }
 
 // ============================================== 11. which windows are settings windows
+// The window classes the stale-configuration feature depends on, one test row
+// each: a rename upstream (or a regression in the suffix heuristic) has to show
+// up here instead of in the field. The trailing-version rows are the reason the
+// heuristic strips a version suffix before the suffix test.
+const SETTINGS_CLASSES = [
+    'systemsettings',
+    'systemsettings6',
+    'kdesystemsettings',
+    'org.kde.systemsettings',
+    'plasma-settings',
+    'plasma-systemsettings',
+    'kcmshell',
+    'kcmshell5',
+    'kcmshell6',
+];
+
+// Look-alikes that must stay unrecognised: "settings" as a substring is not
+// enough, and a trailing version does not turn a helper into a host.
+const LOOK_ALIKE_CLASSES = [
+    'plasma-settings-helper',
+    'not-settings-really',
+    'systemsettings-helper',
+    'myapp',
+];
+
 {
-    check(() => {
-        const classes = ['systemsettings', 'plasma-systemsettings', 'plasma-settings',
-            'kdesystemsettings', 'org.kde.systemsettings',
-            'kcmshell', 'kcmshell5', 'kcmshell6'];
-        for (const className of classes) {
+    for (const className of SETTINGS_CLASSES) {
+        check(() => {
             const { context } = load({ windows: [] });
             activate(context, makeWindow('Settings', { resourceClass: className }));
             assert.equal(context.settingsWindowSeen, true, className + ' is a settings window');
-        }
+        }, 'the settings window class ' + className + ' is recognised');
+    }
 
-        // The suffix of the whole class decides, so a name that only carries
-        // "settings" somewhere is not a settings window.
-        for (const className of ['plasma-settings-helper', 'not-settings-really',
-            'systemsettings-helper', 'myapp']) {
+    for (const className of LOOK_ALIKE_CLASSES) {
+        check(() => {
             const { context } = load({ windows: [] });
             activate(context, makeWindow('Settings', { resourceClass: className }));
             assert.equal(context.settingsWindowSeen, false, className + ' is not one');
-        }
-    }, 'System Settings hosts and the whole kcmshell family are recognised, look-alikes are not');
+        }, 'the look-alike class ' + className + ' is not a settings window');
+    }
 
     check(() => {
         const { context } = load({ windows: [] });

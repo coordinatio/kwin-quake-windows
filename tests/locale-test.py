@@ -4,7 +4,8 @@
 Verifies that the committed compiled catalog really ships the Russian text
 instead of silently falling back to the English msgids, that it carries exactly
 the msgstr text of po/ru.po (so a catalog built from an older po/ru.po fails),
-and that the catalog, the template and metadata.json agree on the version:
+and that the catalog, the template and metadata.json agree on the version and on
+the translation domain:
 
     python3 tests/locale-test.py
 
@@ -273,12 +274,25 @@ def main():
     # ----------------------------------------------------------------- versions
     try:
         with open(METADATA_PATH, encoding="utf-8") as handle:
-            metadata_version = json.load(handle)["KPlugin"]["Version"]
+            metadata = json.load(handle)
+        metadata_version = metadata["KPlugin"]["Version"]
+        translation_domain = metadata.get("X-KWin-Config-TranslationDomain")
     except (OSError, ValueError, KeyError, TypeError) as error:
-        fail("cannot read KPlugin.Version from metadata.json: %s" % error)
+        fail("cannot read metadata.json: %s" % error)
         return report()
     check(bool(metadata_version) and isinstance(metadata_version, str),
           "metadata.json KPlugin.Version is a non-empty string (%r)" % metadata_version)
+
+    # KWin's generic scripted configuration module looks the UI strings up in the
+    # domain named by X-KWin-Config-TranslationDomain. A drift between that field
+    # and the catalog this test loads would leave every widget in English while
+    # every other check here still passes, so the three have to agree.
+    mo_stem = os.path.splitext(os.path.basename(MO_PATH))[0]
+    check(translation_domain == DOMAIN,
+          "metadata.json X-KWin-Config-TranslationDomain is %r (got %r)"
+          % (DOMAIN, translation_domain))
+    check(mo_stem == DOMAIN,
+          "the catalog file name spells the domain %r (got %r)" % (DOMAIN, mo_stem))
 
     ru_project = (header_field(ru_header, "Project-Id-Version") or "").split()
     check(ru_project[:1] == [DOMAIN],

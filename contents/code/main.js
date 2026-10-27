@@ -37,6 +37,14 @@ var SAFETY_TIMEOUT_MS = 1000;
 // when options.configChanged never arrives, and this watchdog keeps the reload
 // request path itself alive; it replays too when the safety timer could not be
 // created at all.
+//
+// Belt and braces on purpose: the two timers encode two different guarantees -
+// a press is never lost, and the reload request path can never latch while
+// nothing is pending - and both paths may replay the same queue safely, because
+// replayPendingPresses() clears the queue before it acts. Keeping them apart
+// also keeps makeTimer() returning null from silently disabling both guards at
+// once: each timeout handler is written so that a missing timer of the other
+// kind still leaves a way out.
 var CONFIG_WATCHDOG_MS = 2000;
 
 var slotRegex = [];
@@ -74,6 +82,11 @@ var pendingPresses = [];
 var pendingToggleTimer = null;
 
 // Single-shot watchdog for an unanswered reload request, created lazily.
+//
+// Neither timer is stopped when the script is unloaded: KWin offers no unload
+// hook, so a JS-owned QTimer can outlive the script. That is harmless because
+// every handler behind them is defensive - it re-reads the configuration, finds
+// nothing pending and returns, and any throw is caught and logged.
 var configWatchdogTimer = null;
 
 var initialized = false;
@@ -225,9 +238,12 @@ function endsWith(value, suffix) {
  * resource name end with the module name, so the suffix decides: a look-alike
  * such as "not-settings-really" or "plasma-settings-helper" is not a settings
  * window, while "org.kde.systemsettings" is.
+ *
+ * A trailing version number is not part of the name, so "systemsettings6" and
+ * "kcmshell6" are recognised exactly like their unversioned forms.
  */
 function isSettingsWindow(client) {
-    var name = windowClass(client);
+    var name = windowClass(client).replace(/[0-9]+$/, "");
     if (!name) {
         return false;
     }
@@ -341,6 +357,21 @@ function stopConfigWatchdog() {
 }
 
 /**
+ * Mirror of stopConfigWatchdog() for the other timer: a timeout has been handled,
+ * so the sibling timer must not fire later for a queue that is already replayed.
+ */
+function stopSafetyTimer() {
+    if (!pendingToggleTimer) {
+        return;
+    }
+    try {
+        pendingToggleTimer.stop();
+    } catch (error) {
+        warn("could not stop the pending toggle timer: " + error);
+    }
+}
+
+/**
  * options.configChanged never arrived. Clearing awaitingConfig keeps the reload
  * request path alive instead of ignoring every later request.
  *
@@ -357,6 +388,9 @@ function onConfigWatchdogTimeout() {
     if (!hasPendingPresses()) {
         return;
     }
+    // The queue is replayed right here, so the safety timer must not fire a
+    // second time for it after its own deadline.
+    stopSafetyTimer();
     rereadConfigAndReplay();
 }
 
@@ -418,8 +452,14 @@ function replayPendingPresses() {
             }
             if (!slotRegex[index]) {
                 // The slot was disabled or emptied while the press was deferred.
-                info("the press on slot " + (index + 1) +
-                     " was dropped because the slot is now disabled");
+                // Reported once per configuration generation like the other two
+                // unusable-slot messages, otherwise a stale press replayed after
+                // every Apply fills the journal.
+                if (!inactiveSlotLogged[index]) {
+                    inactiveSlotLogged[index] = true;
+                    info("the press on slot " + (index + 1) +
+                         " was dropped because the slot is now disabled");
+                }
                 continue;
             }
             try {
@@ -457,13 +497,7 @@ function onConfigChanged() {
     // becoming active afterwards.
     settingsWindowSeen = isSettingsWindow(currentActiveWindow());
     stopConfigWatchdog();
-    if (pendingToggleTimer) {
-        try {
-            pendingToggleTimer.stop();
-        } catch (error) {
-            warn("could not stop the pending toggle timer: " + error);
-        }
-    }
+    stopSafetyTimer();
     replayPendingPresses();
 }
 
@@ -492,6 +526,9 @@ function onPendingToggleTimeout() {
     }
     warn("KWin did not confirm the configuration reload, applying the pending toggle(s) anyway");
     awaitingConfig = false;
+    // The timeout is handled here, so the sibling watchdog must not stay armed
+    // for a reload request this path has just given up on.
+    stopConfigWatchdog();
     rereadConfigAndReplay();
 }
 

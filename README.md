@@ -66,9 +66,11 @@ after the first one. If KWin does not confirm the reload within that time, the p
 presses are carried out anyway after re-reading the configuration one last time — a
 keypress is never lost.
 
-A press that arrives before Apply is replayed with the configuration as it was before that
-Apply: the press happened first, so it is not retroactively applied to the new expression.
-The next press uses the new one.
+A press that arrives before Apply is replayed against the configuration as it was before that
+Apply — *usually*, because this is a race, not a guarantee: it holds when the press was
+deferred before KWin's reparse finished. If Apply lands first and KWin's ~200 ms reparse
+completes before the deferred press is replayed, that press is replayed against the new
+values instead. The next press always uses the new expression.
 
 While the Configure dialog stays focused, every press is remembered and asks for a reload.
 `requestConfigReload()` ignores a request while one is still pending, so presses spaced
@@ -146,7 +148,16 @@ with an explanation when PyQt6 is missing; the structural checks always run.
 every `.pot` msgid must have a Russian translation in `contents/locale/ru/LC_MESSAGES/quakewindows.mo`
 that differs from the English source and is exactly the `msgstr` text of `po/ru.po`, the catalog
 must not hold msgids missing from the template, and the version in `metadata.json`, `po/ru.po`
-and `po/quakewindows.pot` must agree.
+and `po/quakewindows.pot` must agree; `X-KWin-Config-TranslationDomain` in `metadata.json` must
+name the same domain the catalog is loaded from.
+
+`./tests/run-kcm-test.sh` is the optional end-to-end check of the settings dialog: it builds
+`tests/kcm-test.cpp`, installs the package with `kpackagetool6` into a throw-away `XDG_DATA_HOME`
+and drives the real KCM (KConfigXT ↔ `config.ui` ↔ `[Script-quakewindows]` ↔ translations), first
+with `LANG=C.UTF-8` and then with `LANG=ru_RU.UTF-8` when that locale is installed. It needs
+`g++`, the Qt6/KF6 development headers, `kpackagetool6` and KWin's generic scripted configuration
+plugin; when any of them is missing it explains that and exits 0. Nothing is written outside its
+temporary directory.
 
 ## Credits
 
