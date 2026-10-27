@@ -40,8 +40,9 @@ expression matched against the window title:
   `\.rocket\.chat` work as expected. Invalid patterns are ignored and reported in the KWin
   journal; the other slots keep working.
 * **Defaults** in the dialog clears every expression and enables every slot.
-* A field that contains only whitespace counts as empty, so the slot is disabled — strip
-  significant leading or trailing spaces if you really need them.
+* A field that contains only whitespace is treated as empty, so the slot is disabled. Any
+  other expression is used verbatim, so leading and trailing spaces are significant: a
+  pattern that ends with a space only matches a caption that ends with that space.
 
 ### Hotkeys
 
@@ -135,13 +136,17 @@ translatable string of the form is present in `po/quakewindows.pot`, that the te
 no obsolete entries, and that `metadata.json` carries `Name` and `Description` together with
 their `[ru]` variants.
 
-`python3 tests/ui-test.py` checks the settings form itself with PyQt6 (`QT_QPA_PLATFORM` is
-forced to `offscreen`); it is optional and skips with an explanation when PyQt6 is missing.
+`python3 tests/ui-test.py` checks the structure of `contents/config/main.xml` and
+`contents/ui/config.ui` with the standard library only (entry types and defaults, the group,
+the toggle connections, the kcfg_* widget set), then exercises the instantiated form with
+PyQt6 (`QT_QPA_PLATFORM` is forced to `offscreen`). The widget part is optional and skips
+with an explanation when PyQt6 is missing; the structural checks always run.
 
 `python3 tests/locale-test.py` checks the committed catalogs (Python standard library only):
 every `.pot` msgid must have a Russian translation in `contents/locale/ru/LC_MESSAGES/quakewindows.mo`
-that differs from the English source, the catalog must not hold msgids missing from the
-template, and the version in `metadata.json`, `po/ru.po` and `po/quakewindows.pot` must agree.
+that differs from the English source and is exactly the `msgstr` text of `po/ru.po`, the catalog
+must not hold msgids missing from the template, and the version in `metadata.json`, `po/ru.po`
+and `po/quakewindows.pot` must agree.
 
 ## Credits
 

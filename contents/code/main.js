@@ -34,8 +34,9 @@ var SAFETY_TIMEOUT_MS = 1000;
 // callDBus() drops error replies, so this is the only way out.
 //
 // Two timers guard the reload: the safety timer above replays a deferred press
-// when options.configChanged never arrives, and this watchdog only keeps the
-// reload request path itself alive while no press is pending.
+// when options.configChanged never arrives, and this watchdog keeps the reload
+// request path itself alive; it replays too when the safety timer could not be
+// created at all.
 var CONFIG_WATCHDOG_MS = 2000;
 
 var slotRegex = [];
@@ -221,9 +222,9 @@ function endsWith(value, suffix) {
  * Recognises the windows that host the settings dialog: systemsettings,
  * plasma-systemsettings, plasma-settings, kdesystemsettings and reverse-DNS ids
  * like org.kde.systemsettings, plus every kcmshell* module. The class and the
- * resource name are dot/hyphen separated identifiers, so only the last component
- * is judged: "not-settings-really" and "plasma-settings-helper" are not settings
- * windows, while "org.kde.systemsettings" is.
+ * resource name end with the module name, so the suffix decides: a look-alike
+ * such as "not-settings-really" or "plasma-settings-helper" is not a settings
+ * window, while "org.kde.systemsettings" is.
  */
 function isSettingsWindow(client) {
     var name = windowClass(client);
@@ -233,8 +234,7 @@ function isSettingsWindow(client) {
     if (name.indexOf("kcmshell") === 0) {
         return true;
     }
-    var parts = name.split(/[^a-z0-9]+/);
-    return endsWith(parts[parts.length - 1], "settings");
+    return endsWith(name, "settings");
 }
 
 /**
@@ -289,8 +289,8 @@ function requestConfigReload() {
 
 // Two timers, because they answer two different questions: the 1 s safety timer
 // guarantees that a deferred press is never lost even when KWin never confirms
-// the reload, while the 2 s watchdog only keeps the reload request path alive and
-// therefore fires when nothing is pending.
+// the reload, while the 2 s watchdog keeps the reload request path alive and is
+// the fallback replay path when no safety timer could be created.
 
 /**
  * Creates a single-shot timer lazily. Returns null when KWin cannot create one,
@@ -343,13 +343,21 @@ function stopConfigWatchdog() {
 /**
  * options.configChanged never arrived. Clearing awaitingConfig keeps the reload
  * request path alive instead of ignoring every later request.
+ *
+ * A queued press is rescued here as well: the 1 s safety timer is the normal way
+ * out, but makeTimer() may have failed to create it at all, in which case this
+ * watchdog is the only thing left that can replay. No second warning is logged
+ * for that: the timeout itself is the single report of the stuck reload.
  */
 function onConfigWatchdogTimeout() {
-    if (!awaitingConfig) {
+    if (awaitingConfig) {
+        awaitingConfig = false;
+        warn("KWin did not confirm the configuration reload");
+    }
+    if (!hasPendingPresses()) {
         return;
     }
-    awaitingConfig = false;
-    warn("KWin did not confirm the configuration reload");
+    rereadConfigAndReplay();
 }
 
 function safetyTimer() {
@@ -460,14 +468,10 @@ function onConfigChanged() {
 }
 
 /**
- * KWin did not confirm the reload in time: a hotkey press must never be lost.
+ * Re-reads the configuration once more and replays whatever is queued. Shared by
+ * the two timeout paths, which both mean "KWin will not confirm this reload".
  */
-function onPendingToggleTimeout() {
-    if (!hasPendingPresses()) {
-        return;
-    }
-    warn("KWin did not confirm the configuration reload, applying the pending toggle(s) anyway");
-    awaitingConfig = false;
+function rereadConfigAndReplay() {
     // Best effort: if KWin reparsed kwinrc but the configChanged signal was lost,
     // this picks the fresh values up. When nothing changed, applyConfig() is a
     // no-op thanks to the signature check.
@@ -480,20 +484,35 @@ function onPendingToggleTimeout() {
 }
 
 /**
+ * KWin did not confirm the reload in time: a hotkey press must never be lost.
+ */
+function onPendingToggleTimeout() {
+    if (!hasPendingPresses()) {
+        return;
+    }
+    warn("KWin did not confirm the configuration reload, applying the pending toggle(s) anyway");
+    awaitingConfig = false;
+    rereadConfigAndReplay();
+}
+
+/**
  * Watches the active window to find out when the settings dialog was used. KWin
  * does not tell scripts about a script-configuration change, so this is the only
  * way to know when to ask KWin to re-read kwinrc.
  */
 function onWindowActivated(client) {
-    if (replaying) {
-        // Caused by replaying a press after a reload, which the user did not
-        // trigger: the configuration was reloaded a moment ago.
-        return;
-    }
     if (isSettingsWindow(client)) {
         // Values are written when the dialog is applied or closed, so the reload
-        // has to wait until focus leaves it.
+        // has to wait until focus leaves it. The latch is updated even while a
+        // press is replayed: replaying can focus a settings window, and that one
+        // is still up, so its Apply must not be missed.
         settingsWindowSeen = true;
+        return;
+    }
+    if (replaying) {
+        // Caused by replaying a press after a reload, which the user did not
+        // trigger: the configuration was reloaded a moment ago, so only the
+        // reload request of this focus loss is suppressed.
         return;
     }
     if (settingsWindowSeen) {

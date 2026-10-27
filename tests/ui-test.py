@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """UI checks for the Quake Windows settings form.
 
-Loads contents/ui/config.ui with PyQt6's uic under the offscreen QPA platform and
-verifies the structure of the form and its kcfg_* widgets, so the settings dialog can
-be checked without a display and without starting System Settings:
+Two independent parts:
+
+1. Structure of contents/config/main.xml and contents/ui/config.ui, verified with
+   the standard library only. These checks always run.
+2. The instantiated widgets, loaded from contents/ui/config.ui with PyQt6's uic
+   under the offscreen QPA platform, so the form can be exercised without a
+   display and without starting System Settings. This part is optional: when
+   PyQt6 is missing the script explains that, keeps the structural results and
+   exits 0.
 
     python3 tests/ui-test.py
-
-The script is optional: when PyQt6 is not installed it explains that and exits 0.
 """
 
 import os
 import sys
 import xml.etree.ElementTree as ET
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# Forced, not defaulted: a caller that exports another platform must not make the
+# optional widget part fail (or try to reach a display).
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UI_PATH = os.path.join(REPO_ROOT, "contents", "ui", "config.ui")
@@ -23,14 +29,6 @@ MAIN_XML_PATH = os.path.join(REPO_ROOT, "contents", "config", "main.xml")
 # Mirrors SLOT_COUNT in contents/code/main.js; tests/main-js-test.mjs cross-checks
 # that the three definitions stay in sync.
 SLOTS = 7
-
-try:
-    from PyQt6 import QtWidgets, uic  # noqa: E402
-except ImportError as error:
-    print("SKIP: PyQt6 is not available (%s)." % error)
-    print("      Install it with 'python3 -m pip install PyQt6' or your distribution's")
-    print("      python3-pyqt6 package. The settings form itself does not need Python.")
-    sys.exit(0)
 
 failures = []
 
@@ -106,6 +104,16 @@ for slot in range(1, SLOTS + 1):
           "ui connects kcfg_Enabled%d toggled -> kcfg_WindowName%d setEnabled" % (slot, slot))
 
 # ---------------------------------------------------------------- runtime widgets
+try:
+    from PyQt6 import QtWidgets, uic
+except ImportError as error:
+    if failures:
+        print("\n%d structural check(s) failed" % len(failures))
+    print("\nSKIP: the widget checks need PyQt6, which is not available (%s)." % error)
+    print("      Install it with 'python3 -m pip install PyQt6' or your distribution's")
+    print("      python3-pyqt6 package. The settings form itself does not need Python.")
+    sys.exit(1 if failures else 0)
+
 app = QtWidgets.QApplication(sys.argv)
 widget = uic.loadUi(UI_PATH)
 check(widget is not None, "uic can instantiate the form")

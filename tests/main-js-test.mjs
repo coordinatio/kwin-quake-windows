@@ -61,11 +61,18 @@ class MockTimer {
         this.running = false;
     }
     fire() {
+        // A timer that is not running delivers no timeout, exactly like Qt. The
+        // return value lets a test tell "nothing was armed" from "fired", so no
+        // test can silently rely on firing a stopped timer.
+        if (!this.running) {
+            return false;
+        }
         // A single-shot timer stops before its handler runs.
         this.running = false;
         for (const fn of this.timeout.fns) {
             fn();
         }
+        return true;
     }
 }
 
@@ -157,6 +164,19 @@ function load(state) {
             stringify() {
                 throw new Error('poisoned JSON');
             },
+        };
+    }
+    if (state.failTimerCreation) {
+        // The first N QTimer constructions throw, which is the case makeTimer()
+        // turns into a null timer: the script then has to work without that timer.
+        const HostTimer = context.QTimer;
+        let constructions = 0;
+        context.QTimer = function () {
+            constructions += 1;
+            if (constructions <= state.failTimerCreation) {
+                throw new Error('no timer available');
+            }
+            return new HostTimer();
         };
     }
     vm.runInContext(SOURCE, context, { filename: 'main.js' });
@@ -341,6 +361,37 @@ function pendingIndexes(context) {
             /slot 3 is disabled or has no valid expression/,
             'a new generation reports the unusable slot again');
     }, 'an applyConfig() that throws mid-loop commits nothing and keeps the old generation');
+}
+
+// ===================== 1d. a configuration change must not re-register (finding 6)
+//
+// The original implementation called init() again from options.configChanged,
+// which registered every shortcut a second time and doubled the signal handlers.
+{
+    const { context, config } = load({ WindowName1: '^quake$' });
+
+    check(() => {
+        assert.equal(harness.shortcuts.length, 7, 'init() registered seven shortcuts once');
+
+        config.WindowName1 = '^other$';
+        emitConfigChanged(context);
+        config.WindowName2 = '^third$';
+        emitConfigChanged(context);
+        emitConfigChanged(context);
+
+        assert.equal(harness.shortcuts.length, 7,
+            'a configuration change registers no shortcut again (got '
+            + harness.shortcuts.length + ' registerShortcut calls)');
+        assert.equal(context.workspace.currentDesktopChanged.fns.length, 1,
+            'currentDesktopChanged still has one listener');
+        assert.equal(context.workspace.windowActivated.fns.length, 1,
+            'windowActivated still has one listener');
+        assert.equal(context.options.configChanged.fns.length, 1,
+            'options.configChanged still has one listener');
+        assert.equal(harness.warnings.length, 0, 'nothing warns');
+        assert.match(harness.infos.join('\n'), /active slots: 1: \^other\$, 2: \^third\$/,
+            'the new configuration was applied');
+    }, 'a configChanged after init re-applies the values without re-registering anything');
 }
 
 // ====================================================== 2. matching / enabled flags
@@ -685,7 +736,10 @@ function pendingIndexes(context) {
         emitConfigChanged(context);
         assert.equal(target.minimized, false, 'two presses toggle nothing');
         assert.equal(context.awaitingConfig, false);
-        safetyTimer(context).fire();
+        assert.equal(safetyTimer(context).running, false,
+            'the reload stopped the safety timer');
+        assert.equal(safetyTimer(context).fire(), false,
+            'firing a stopped timer delivers nothing');
         assert.equal(target.minimized, false, 'a stale safety timer replays nothing');
     }, 'presses arriving during a pending reload are counted per slot, not queued');
 }
@@ -850,6 +904,42 @@ function pendingIndexes(context) {
     }, 'a windowActivated delivered after the replay loses no press and costs at most one reload');
 }
 
+// ======================= 5g. a replay that focuses a settings window re-arms the latch
+{
+    const dialog = makeWindow('System Settings', { resourceClass: 'systemsettings' });
+    dialog.minimized = true;      // replaying the press restores and activates it
+    const normal = makeWindow('terminal');
+    const { context } = load({ WindowName1: '^System Settings$', windows: [dialog] });
+
+    check(() => {
+        activate(context, dialog);                 // the dialog is up
+        assert.equal(context.settingsWindowSeen, true);
+        activate(context, normal);                 // focus loss -> reload, latch cleared
+        assert.equal(context.settingsWindowSeen, false);
+        assert.equal(reconfigureCalls().length, 1);
+
+        harness.shortcuts[0].callback();            // deferred while awaitingConfig
+        assert.deepEqual(pendingIndexes(context), [0], 'the press is deferred');
+
+        // The reload lands with the normal window focused, so the reload itself
+        // clears the latch; the replay then restores the dialog, which activates
+        // it. That activation has to re-arm the latch even though the replay is
+        // still running.
+        emitConfigChanged(context);
+        assert.equal(dialog.minimized, false, 'the replayed press restored the dialog');
+        assert.equal(context.replaying, false, 'the replay flag is cleared by finally');
+        assert.equal(reconfigureCalls().length, 1, 'the replay requested no reload');
+        assert.equal(context.settingsWindowSeen, true,
+            'a settings window activated by the replay re-arms the latch');
+
+        activate(context, normal);                 // leaving it is noticed again
+        assert.equal(context.awaitingConfig, true);
+        assert.equal(context.settingsWindowSeen, false, 'the focus loss clears the latch');
+        assert.equal(reconfigureCalls().length, 2,
+            'the re-armed latch picks up the next focus loss');
+    }, 'a settings window activated during a replay re-arms the latch without a reload');
+}
+
 // ============================================ 6. reload watchdog (finding 4)
 {
     const window1 = makeWindow('first title');
@@ -874,6 +964,8 @@ function pendingIndexes(context) {
         assert.match(harness.warnings[harness.warnings.length - 1],
             /did not confirm the configuration reload/);
         watchdogTimer(context).fire();            // a later timeout must stay silent
+        assert.equal(watchdogTimer(context).fire(), false,
+            'the stopped watchdog delivers nothing');
         assert.equal(harness.warnings.length, warningsBefore + 1, 'the warning is logged once');
     }, 'the watchdog unsticks an unconfirmed reload and warns once');
 
@@ -895,6 +987,48 @@ function pendingIndexes(context) {
         assert.equal(watchdogTimer(context).running, false, 'configChanged stops the watchdog');
         assert.equal(context.awaitingConfig, false);
     }, 'options.configChanged stops the armed watchdog');
+}
+
+// ========== 6b. the watchdog replays when no safety timer could be created (finding 4)
+{
+    const window1 = makeWindow('first title');
+    const { context, config } = load({
+        WindowName1: '^first title$',
+        windows: [window1],
+        // The safety timer cannot be created at all, so the 2 s watchdog is the
+        // only thing left that can rescue the queued press.
+        failTimerCreation: 1,
+    });
+
+    check(() => {
+        activate(context, settingsWindow());
+        harness.shortcuts[0].callback();
+        assert.equal(window1.minimized, false, 'the press is deferred');
+        assert.deepEqual(pendingIndexes(context), [0], 'the press is pending');
+        assert.equal(context.pendingToggleTimer, null, 'the safety timer does not exist');
+        assert.match(harness.warnings.join('\n'),
+            /could not create the pending toggle timer/);
+        assert.equal(reconfigureCalls().length, 1, 'the press asked for a reload');
+        assert.equal(watchdogTimer(context).running, true, 'the watchdog is armed instead');
+    }, 'a press is queued even when the safety timer cannot be created');
+
+    check(() => {
+        const renamed = makeWindow('renamed');
+        context.workspace.windows = [window1, renamed];
+        config.WindowName1 = '^renamed$';
+
+        const warningsBefore = harness.warnings.length;
+        assert.equal(watchdogTimer(context).fire(), true, 'the armed watchdog fires');
+        assert.equal(harness.warnings.length, warningsBefore + 1,
+            'the watchdog logs exactly one warning, not a second one for the replay');
+        assert.match(harness.warnings[harness.warnings.length - 1],
+            /did not confirm the configuration reload/);
+        assert.deepEqual(pendingIndexes(context), [], 'the press is no longer pending');
+        assert.equal(context.awaitingConfig, false, 'the state machine is unstuck');
+        assert.equal(renamed.minimized, true, 'the press was replayed with the re-read expression');
+        assert.equal(window1.minimized, false, 'the old expression was not used');
+        assert.equal(watchdogTimer(context).fire(), false, 'the stopped watchdog is silent');
+    }, 'the watchdog re-reads the configuration and replays a press when no safety timer exists');
 }
 
 // ===================================== 7. an already active settings window (finding 5)
@@ -982,10 +1116,12 @@ function pendingIndexes(context) {
     }, 'a late configChanged after the timeout does not toggle twice');
 
     check(() => {
-        // Nothing pending on timeout is a no-op: no warning, no re-read.
+        // Nothing pending on timeout is a no-op: no warning, no re-read. The timer
+        // has to be running for the timeout to be delivered at all.
+        safetyTimer(context).start(1000);
         const warningsBefore = harness.warnings.length;
         const infosBefore = harness.infos.length;
-        safetyTimer(context).fire();
+        assert.equal(safetyTimer(context).fire(), true, 'the armed timer fires');
         assert.equal(harness.warnings.length, warningsBefore);
         assert.equal(harness.infos.length, infosBefore, 'the configuration is not re-read');
     }, 'an empty pending set on the safety timeout does nothing');
@@ -1059,9 +1195,10 @@ function pendingIndexes(context) {
             assert.equal(context.settingsWindowSeen, true, className + ' is a settings window');
         }
 
-        // Only the last dot/hyphen separated component is judged, so a name that
-        // merely carries "settings" somewhere is not a settings window.
-        for (const className of ['plasma-settings-helper', 'not-settings-really', 'myapp']) {
+        // The suffix of the whole class decides, so a name that only carries
+        // "settings" somewhere is not a settings window.
+        for (const className of ['plasma-settings-helper', 'not-settings-really',
+            'systemsettings-helper', 'myapp']) {
             const { context } = load({ windows: [] });
             activate(context, makeWindow('Settings', { resourceClass: className }));
             assert.equal(context.settingsWindowSeen, false, className + ' is not one');

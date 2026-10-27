@@ -16,6 +16,12 @@
 # Therefore this catalog must not use msgctxt - lconvert writes one
 # ("KWin::QuakeWindowsConfigForm|"), so it is dropped below.
 #
+# The header must also survive "msgfmt --check", which warns about a missing
+# PO-Revision-Date, about the gettext placeholder "YEAR-MO-DA HO:MI+ZONE" and
+# about a missing or empty Language. The template therefore carries the date of
+# its last regeneration (bump it when the form changes) and "Language: en", the
+# language of the msgids. KWin's gettext lookup ignores both fields.
+#
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 set -euo pipefail
@@ -56,9 +62,10 @@ header = [
     'msgstr ""',
     '"Project-Id-Version: quakewindows\\n"',
     '"Report-Msgid-Bugs-To: angrycore@gmail.com\\n"',
+    '"PO-Revision-Date: 2026-10-27 18:31+0300\\n"',
     '"Last-Translator: none\\n"',
     '"Language-Team: none\\n"',
-    '"Language: \\n"',
+    '"Language: en\\n"',
     '"MIME-Version: 1.0\\n"',
     '"Content-Type: text/plain; charset=UTF-8\\n"',
     '"Content-Transfer-Encoding: 8bit\\n"',

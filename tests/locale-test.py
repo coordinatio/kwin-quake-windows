@@ -2,8 +2,9 @@
 """Catalog checks for the Quake Windows translations.
 
 Verifies that the committed compiled catalog really ships the Russian text
-instead of silently falling back to the English msgids, and that the catalog,
-the template and metadata.json agree on the version:
+instead of silently falling back to the English msgids, that it carries exactly
+the msgstr text of po/ru.po (so a catalog built from an older po/ru.po fails),
+and that the catalog, the template and metadata.json agree on the version:
 
     python3 tests/locale-test.py
 
@@ -252,6 +253,22 @@ def main():
     if ru_header is None:
         fail("po/ru.po has no valid header entry")
         return report()
+
+    # The compiled catalog must carry the text of po/ru.po verbatim. Without this
+    # check a .mo that was not rebuilt after a ru.po edit still passes: the stale
+    # string is a translation too, it just is not the committed one.
+    ru_msgstr = {entry["msgid"]: entry["msgstr"] for entry in ru_entries
+                 if entry["msgctxt"] is None and entry["msgid"] != ""}
+    mismatched = []
+    for msgid in pot_msgids:
+        expected = ru_msgstr.get(msgid)
+        if expected is None:
+            mismatched.append((msgid, "missing from po/ru.po"))
+        elif translation.gettext(msgid) != expected:
+            mismatched.append((msgid, "the catalog holds %r" % translation.gettext(msgid)))
+    check(not mismatched,
+          "the compiled catalog carries the msgstr text of po/ru.po"
+          + ("" if not mismatched else " (mismatched: %s)" % mismatched))
 
     # ----------------------------------------------------------------- versions
     try:
