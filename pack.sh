@@ -2,6 +2,10 @@
 #
 # Builds quakewindows.kwinscript from the package contents.
 #
+# The archive is assembled in a temporary staging directory that is removed on
+# exit: building never modifies the working tree, and catalogs of languages that
+# were removed from po/ cannot survive in the package.
+#
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 set -euo pipefail
@@ -19,32 +23,50 @@ for required in contents/config/main.xml contents/ui/config.ui contents/code/mai
     fi
 done
 
-# md5sum of the compiled catalogs, independent of git, so the build can tell
-# whether tools/build-locale.sh changed a tracked file.
+staging="$(mktemp -d)"
+trap 'rm -rf "$staging"' EXIT
+
+cp -a contents/ LICENSE metadata.json "$staging"/
+
+# md5sum of the compiled catalogs under a package root. The paths are relative to
+# that root, so the staged catalogs can be compared with the committed ones.
 catalog_checksum() {
-    if [ -d contents/locale ]; then
-        find contents/locale -type f -name '*.mo' | LC_ALL=C sort | xargs -r md5sum
+    local root="$1"
+    if [ -d "$root/locale" ]; then
+        ( cd "$root" && find locale -type f -name '*.mo' | LC_ALL=C sort | xargs -r md5sum )
     fi
 }
 
-locale_before=$(catalog_checksum)
-
-# Recompile the catalogs so the package cannot ship translations that drifted
-# away from po/*.po. Without msgfmt the committed .mo files are packaged as they
-# are, which is fine as long as po/ was not touched.
 if command -v msgfmt >/dev/null 2>&1; then
-    tools/build-locale.sh
+    # Rebuild the catalogs from po/*.po inside the staging tree only, so the
+    # package cannot ship translations that drifted away from po/. Committed
+    # files are never touched; a preview of the drift is reported below.
+    rm -rf "$staging/contents/locale"
+    shopt -s nullglob
+    po_files=(po/*.po)
+    shopt -u nullglob
+    if [ ${#po_files[@]} -eq 0 ]; then
+        echo "ERROR: no po/*.po files found, refusing to build $package" >&2
+        exit 1
+    fi
+    for po_file in "${po_files[@]}"; do
+        lang="$(basename "$po_file" .po)"
+        target_dir="$staging/contents/locale/${lang}/LC_MESSAGES"
+        mkdir -p "$target_dir"
+        msgfmt --check -o "${target_dir}/quakewindows.mo" "$po_file"
+    done
 else
     echo "WARNING: msgfmt is not installed, packaging the committed contents/locale" >&2
     echo "         files unchanged. Install gettext and rebuild to update them." >&2
 fi
 
-if [ "$locale_before" != "$(catalog_checksum)" ]; then
-    echo "WARNING: tools/build-locale.sh changed contents/locale." >&2
+if [ "$(catalog_checksum contents)" != "$(catalog_checksum "$staging/contents")" ]; then
+    echo "WARNING: contents/locale does not match the catalogs built from po/." >&2
     echo "         Commit contents/locale together with po/ before releasing." >&2
 fi
 
 rm -f "$package"
-zip -r "$package" contents/ LICENSE metadata.json
+( cd "$staging" && zip -qr "$package" contents/ LICENSE metadata.json )
+mv -f "$staging/$package" "$package"
 
 echo "Built $package"

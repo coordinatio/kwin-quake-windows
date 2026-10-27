@@ -326,7 +326,7 @@ function pendingIndexes(context) {
     }, 'pressing an inactive slot does not request a configuration reload');
 }
 
-// ======================================= 2b. a slot matching nothing (finding 5)
+// =================================== 2b. a slot matching nothing (finding 5)
 {
     const window1 = makeWindow('something else');
     load({ WindowName1: '^typo$', windows: [window1] });
@@ -340,6 +340,58 @@ function pendingIndexes(context) {
         assert.equal(reconfigureCalls().length, 0,
             'a valid expression never requests a reload');
     }, 'a slot with a valid expression that matches nothing logs one info line');
+
+    check(() => {
+        // The same report must not be repeated on every press forever (finding 3).
+        const before = harness.infos.length;
+        harness.shortcuts[0].callback();
+        harness.shortcuts[0].callback();
+        assert.equal(harness.infos.length, before,
+            'the "no window matches" line is written once per configuration');
+    }, 'a slot matching nothing is reported once per configuration, not once per press');
+}
+
+// ================================ 2d. journal noise of unusable slots (finding 3)
+{
+    const window1 = makeWindow('quake');
+    const { context, config } = load({
+        Enabled1: false, WindowName1: 'quake',
+        WindowName2: '[invalid(',
+        WindowName3: '   ',
+        // A valid slot whose expression matches no window at all.
+        WindowName4: '^typo$',
+        windows: [window1],
+    });
+
+    check(() => {
+        const before = harness.infos.length;
+        for (let round = 0; round < 3; ++round) {
+            for (const slot of [0, 1, 2, 3]) {
+                harness.shortcuts[slot].callback();
+            }
+        }
+        const logged = harness.infos.slice(before).join('\n');
+        for (const slot of [1, 2, 3]) {
+            assert.equal(logged.match(new RegExp('slot ' + slot + ' is disabled', 'g'), []).length, 1,
+                'slot ' + slot + ' is reported once');
+        }
+        assert.equal(logged.match(/no window matches slot 4/g, []).length, 1,
+            'the unmatched slot is reported once');
+        assert.equal(window1.minimized, false, 'no press toggled anything');
+    }, 'each unusable slot fills the journal once per configuration generation');
+
+    check(() => {
+        // A new generation resets the memory, so a slot that is still unusable is
+        // reported once again after the configuration changed.
+        config.WindowName4 = '^also a typo$';
+        emitConfigChanged(context);
+        const before = harness.infos.length;
+        harness.shortcuts[0].callback();
+        harness.shortcuts[3].callback();
+        const logged = harness.infos.slice(before).join('\n');
+        assert.match(logged, /slot 1 is disabled or has no valid expression/);
+        assert.match(logged, /no window matches slot 4/);
+    }, 'a new configuration generation reports the unusable slots again');
 }
 
 // ===================================================== 2c. readBool string coercion
@@ -509,11 +561,12 @@ function pendingIndexes(context) {
     }, 'options.configChanged replays the pending press with the fresh configuration');
 
     check(() => {
-        // Focus left the dialog (as it does in real use) and the reload completed.
+        // The reload completed, so the latch is cleared and leaving the dialog
+        // has nothing left to reload.
         activate(context, window1);
         assert.equal(context.settingsWindowSeen, false);
-        assert.equal(reconfigureCalls().length, 2, 'focus loss asks for another reload');
-        emitConfigChanged(context);
+        assert.equal(reconfigureCalls().length, 1,
+            'a focus change after a completed reload does not ask for another one');
         assert.equal(context.awaitingConfig, false);
 
         harness.shortcuts[0].callback();
@@ -567,19 +620,110 @@ function pendingIndexes(context) {
             'replaying a press must not request another reload');
         assert.equal(context.awaitingConfig, false);
         assert.equal(context.replaying, false, 'the replay flag is cleared by finally');
-        assert.equal(context.settingsWindowSeen, true,
-            'the settings window stays recorded');
+        assert.equal(context.settingsWindowSeen, false,
+            'the reload cleared the latch: the dialog was not used since then');
     }, 'a replayed press does not request a second configuration reload');
 
     check(() => {
-        // settingsWindowSeen is sticky, so a second Apply in the still focused
-        // dialog is noticed on the next press.
+        // The dialog is focused again and the user pressed OK a second time. The
+        // latch is gone, but the active window decides on its own that the
+        // configuration may be stale, so the press is still deferred.
+        activate(context, settingsWindow());
         harness.shortcuts[0].callback();
         assert.equal(window1.minimized, false, 'the press is deferred again');
         assert.deepEqual(pendingIndexes(context), [0]);
         assert.equal(reconfigureCalls().length, 2, 'and it asks for a reload');
         assert.equal(context.awaitingConfig, true);
     }, 'a second Apply is still detected while the dialog stays focused');
+}
+
+// ============================ 5c. the settings latch heals itself (finding 2)
+{
+    const window1 = makeWindow('first title');
+    const { context } = load({ WindowName1: '^first title$', windows: [window1] });
+
+    check(() => {
+        // The dialog was activated and then closed without any other window
+        // becoming active, so nothing cleared the latch before this press.
+        activate(context, settingsWindow());
+        assert.equal(context.settingsWindowSeen, true);
+        assert.equal(reconfigureCalls().length, 0);
+
+        harness.shortcuts[0].callback();
+        assert.deepEqual(pendingIndexes(context), [0], 'the press is deferred');
+        assert.equal(reconfigureCalls().length, 1, 'and it pays exactly one reconfigure');
+
+        emitConfigChanged(context);
+        assert.equal(context.settingsWindowSeen, false,
+            'the reload clears "the dialog was used since the last reload"');
+        assert.equal(window1.minimized, true, 'the deferred press is replayed');
+    }, 'a latched settings flag costs one reconfigure and is cleared by the reload');
+
+    check(() => {
+        // The latch is gone and no reload is pending, so the next press is not
+        // deferred again: it toggles synchronously without any D-Bus traffic.
+        harness.shortcuts[0].callback();
+        assert.equal(window1.minimized, false, 'the press toggles immediately');
+        assert.equal(reconfigureCalls().length, 1, 'no reload is requested any more');
+        assert.deepEqual(pendingIndexes(context), [], 'nothing is pending');
+    }, 'after the healing reload a press is not deferred again');
+}
+
+// ===================== 5d. a press is dropped when its slot is gone (finding 6)
+{
+    const window1 = makeWindow('quake');
+    const { context, config } = load({ WindowName1: '^quake$', windows: [window1] });
+
+    check(() => {
+        activate(context, settingsWindow());
+        harness.shortcuts[0].callback();
+        assert.deepEqual(pendingIndexes(context), [0], 'the press is deferred');
+
+        // The slot was disabled while the press was waiting.
+        config.Enabled1 = false;
+        emitConfigChanged(context);
+
+        assert.equal(window1.minimized, false, 'the dropped press toggled nothing');
+        assert.deepEqual(pendingIndexes(context), [], 'nothing stays pending');
+        const infos = harness.infos.join('\n');
+        assert.match(infos,
+            /the press on slot 1 was dropped because the slot is now disabled/);
+        assert.doesNotMatch(infos,
+            /slot 1 is disabled or has no valid expression, nothing to toggle/,
+            'the replay reports its own reason, not the live-press message');
+    }, 'a press whose slot was disabled meanwhile is dropped with its own message');
+}
+
+// =========== 5e. a windowActivated delivered after the replay (finding 7)
+{
+    const window1 = makeWindow('first title');
+    window1.minimized = true;      // replaying the press restores and activates it
+    const { context } = load({ WindowName1: '^first title$', windows: [window1] });
+
+    check(() => {
+        activate(context, settingsWindow());
+        harness.shortcuts[0].callback();
+        assert.deepEqual(pendingIndexes(context), [0], 'the press is deferred');
+        assert.equal(reconfigureCalls().length, 1);
+
+        // The Wayland restore path may deliver windowActivated only after the
+        // replay returned, i.e. with `replaying` already false. The flag only
+        // suppresses the synchronous variant; an asynchronous one can cost one
+        // extra reconfigure, which is harmless and pinned here.
+        safetyTimer(context).fire();
+        assert.deepEqual(pendingIndexes(context), [], 'no press is lost');
+        assert.equal(window1.minimized, false, 'the press toggled the window exactly once');
+        assert.equal(reconfigureCalls().length, 1,
+            'the synchronous activation caused by the replay is suppressed');
+
+        activate(context, window1);   // the same activation, delivered late
+        assert.deepEqual(pendingIndexes(context), [], 'still no press is lost');
+        assert.equal(window1.minimized, false, 'and nothing is toggled twice');
+        assert.equal(reconfigureCalls().length, 2,
+            'the asynchronous activation costs at most one extra reconfigure');
+        activate(context, window1);   // the latch is cleared now
+        assert.equal(reconfigureCalls().length, 2, 'the extra reconfigure happens once');
+    }, 'a windowActivated delivered after the replay loses no press and costs at most one reload');
 }
 
 // ============================================ 6. reload watchdog (finding 4)
@@ -783,6 +927,7 @@ function pendingIndexes(context) {
 {
     check(() => {
         const classes = ['systemsettings', 'plasma-systemsettings', 'plasma-settings',
+            'kdesystemsettings', 'org.kde.systemsettings',
             'kcmshell', 'kcmshell5', 'kcmshell6'];
         for (const className of classes) {
             const { context } = load({ windows: [] });
@@ -790,10 +935,14 @@ function pendingIndexes(context) {
             assert.equal(context.settingsWindowSeen, true, className + ' is a settings window');
         }
 
-        const { context } = load({ windows: [] });
-        activate(context, makeWindow('Settings', { resourceClass: 'plasma-settings-helper' }));
-        assert.equal(context.settingsWindowSeen, false, 'a look-alike class name is not one');
-    }, 'plasma-settings and the whole kcmshell family are recognised, look-alikes are not');
+        // Only the last dot/hyphen separated component is judged, so a name that
+        // merely carries "settings" somewhere is not a settings window.
+        for (const className of ['plasma-settings-helper', 'not-settings-really', 'myapp']) {
+            const { context } = load({ windows: [] });
+            activate(context, makeWindow('Settings', { resourceClass: className }));
+            assert.equal(context.settingsWindowSeen, false, className + ' is not one');
+        }
+    }, 'System Settings hosts and the whole kcmshell family are recognised, look-alikes are not');
 
     check(() => {
         const { context } = load({ windows: [] });

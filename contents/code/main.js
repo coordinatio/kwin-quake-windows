@@ -32,20 +32,28 @@ var SAFETY_TIMEOUT_MS = 1000;
 
 // A reload request that stays unanswered must not block the next one forever.
 // callDBus() drops error replies, so this is the only way out.
+//
+// Two timers guard the reload: the safety timer above replays a deferred press
+// when options.configChanged never arrives, and this watchdog only keeps the
+// reload request path itself alive while no press is pending.
 var CONFIG_WATCHDOG_MS = 2000;
-
-// Applications that host the settings dialog. Any other kcmshell* window is
-// recognised by the prefix check in isSettingsWindow().
-var SETTINGS_APP_CLASSES = ["systemsettings", "plasma-systemsettings", "plasma-settings", "kcmshell"];
 
 var slotRegex = [];
 
 // Slot indices (0-based) that have a compiled expression.
 var activeSlots = [];
 
+// Slots whose "nothing to toggle" line was already written for the current
+// configuration. Cleared by applyConfig(), so a slot that is permanently blind
+// costs one journal line per configuration change instead of one per press.
+var inactiveSlotLogged = [];
+
+// The same for a valid expression that matches no window at all.
+var unmatchedSlotLogged = [];
+
 var configSignature = null;
 
-// A settings window was activated since the last reload attempt.
+// A settings window was activated since the last completed reload.
 var settingsWindowSeen = false;
 
 // A reconfigure was requested and options.configChanged has not arrived yet.
@@ -168,6 +176,9 @@ function applyConfig() {
         return;
     }
     configSignature = signature;
+    // New generation: report every unusable slot once again.
+    inactiveSlotLogged = [];
+    unmatchedSlotLogged = [];
 
     var active = [];
     var sources = [];
@@ -193,17 +204,57 @@ function windowClass(client) {
     return name.toLowerCase();
 }
 
+function endsWith(value, suffix) {
+    return value.length >= suffix.length &&
+        value.lastIndexOf(suffix) === value.length - suffix.length;
+}
+
+/**
+ * Recognises the windows that host the settings dialog: systemsettings,
+ * plasma-systemsettings, plasma-settings, kdesystemsettings and reverse-DNS ids
+ * like org.kde.systemsettings, plus every kcmshell* module. The class and the
+ * resource name are dot/hyphen separated identifiers, so only the last component
+ * is judged: "not-settings-really" and "plasma-settings-helper" are not settings
+ * windows, while "org.kde.systemsettings" is.
+ */
 function isSettingsWindow(client) {
     var name = windowClass(client);
     if (!name) {
         return false;
     }
-    for (var i = 0; i < SETTINGS_APP_CLASSES.length; ++i) {
-        if (name === SETTINGS_APP_CLASSES[i]) {
-            return true;
-        }
+    if (name.indexOf("kcmshell") === 0) {
+        return true;
     }
-    return name.indexOf("kcmshell") === 0;
+    var parts = name.split(/[^a-z0-9]+/);
+    return endsWith(parts[parts.length - 1], "settings");
+}
+
+/**
+ * workspace.activeWindow throws for a window that is being destroyed, and no
+ * press handling may break because of it.
+ */
+function currentActiveWindow() {
+    try {
+        return workspace.activeWindow;
+    } catch (error) {
+        warn("could not read the active window: " + error);
+        return null;
+    }
+}
+
+/**
+ * True when readConfig() may still return the values from before the settings
+ * dialog was used, so a press has to wait for options.configChanged instead of
+ * toggling a window from a stale configuration. Three independent reasons: a
+ * reload was requested and not confirmed yet, the dialog was used since the last
+ * reload, or the dialog is focused right now (it stays focused across a reload,
+ * so a second Apply has to be noticed too).
+ */
+function configMayBeStale() {
+    if (awaitingConfig || settingsWindowSeen) {
+        return true;
+    }
+    return isSettingsWindow(currentActiveWindow());
 }
 
 /**
@@ -225,18 +276,32 @@ function requestConfigReload() {
     }
 }
 
-function configWatchdog() {
-    if (configWatchdogTimer) {
-        return configWatchdogTimer;
-    }
+// Two timers, because they answer two different questions: the 1 s safety timer
+// guarantees that a deferred press is never lost even when KWin never confirms
+// the reload, while the 2 s watchdog only keeps the reload request path alive and
+// therefore fires when nothing is pending.
+
+/**
+ * Creates a single-shot timer lazily. Returns null when KWin cannot create one,
+ * which both callers survive by doing nothing.
+ */
+function makeTimer(intervalMs, description, handler) {
     try {
-        configWatchdogTimer = new QTimer();
-        configWatchdogTimer.singleShot = true;
-        configWatchdogTimer.interval = CONFIG_WATCHDOG_MS;
-        configWatchdogTimer.timeout.connect(onConfigWatchdogTimeout);
+        var timer = new QTimer();
+        timer.singleShot = true;
+        timer.interval = intervalMs;
+        timer.timeout.connect(handler);
+        return timer;
     } catch (error) {
-        warn("could not create the configuration watchdog timer: " + error);
-        configWatchdogTimer = null;
+        warn("could not create the " + description + " timer: " + error);
+        return null;
+    }
+}
+
+function configWatchdog() {
+    if (!configWatchdogTimer) {
+        configWatchdogTimer = makeTimer(CONFIG_WATCHDOG_MS, "configuration watchdog",
+            onConfigWatchdogTimeout);
     }
     return configWatchdogTimer;
 }
@@ -277,17 +342,9 @@ function onConfigWatchdogTimeout() {
 }
 
 function safetyTimer() {
-    if (pendingToggleTimer) {
-        return pendingToggleTimer;
-    }
-    try {
-        pendingToggleTimer = new QTimer();
-        pendingToggleTimer.singleShot = true;
-        pendingToggleTimer.interval = SAFETY_TIMEOUT_MS;
-        pendingToggleTimer.timeout.connect(onPendingToggleTimeout);
-    } catch (error) {
-        warn("could not create the pending toggle timer: " + error);
-        pendingToggleTimer = null;
+    if (!pendingToggleTimer) {
+        pendingToggleTimer = makeTimer(SAFETY_TIMEOUT_MS, "pending toggle",
+            onPendingToggleTimeout);
     }
     return pendingToggleTimer;
 }
@@ -331,8 +388,19 @@ function replayPendingPresses() {
     // another reload.
     replaying = true;
     try {
+        // The loop runs in slot-index order, not in the order the keys were
+        // pressed. That is safe because presses of different slots are
+        // independent: each one reads its own expression and its own windows.
+        // Only the resulting activeWindow choice could differ if two expressions
+        // match the same window.
         for (var index = 0; index < SLOT_COUNT; ++index) {
             if (!pressed[index]) {
+                continue;
+            }
+            if (!slotRegex[index]) {
+                // The slot was disabled or emptied while the press was deferred.
+                info("the press on slot " + (index + 1) +
+                     " was dropped because the slot is now disabled");
                 continue;
             }
             try {
@@ -356,6 +424,11 @@ function onConfigChanged() {
         warn("failed to apply configuration: " + error);
     }
     awaitingConfig = false;
+    // After a reload "the dialog was used since the last reload" is by
+    // definition false. Without this the flag latches forever when the dialog is
+    // closed without any window becoming active: every later press would pay a
+    // full reconfigure.
+    settingsWindowSeen = false;
     stopConfigWatchdog();
     if (pendingToggleTimer) {
         try {
@@ -427,17 +500,22 @@ function isRelevant(client, index) {
  * i.e. for a press that is replayed after options.configChanged.
  */
 function toggleWindow(index, configIsFresh) {
-    if (!configIsFresh && (awaitingConfig || settingsWindowSeen)) {
-        // The dialog was used and readConfig() still holds the old values, so the
-        // press waits for options.configChanged instead of toggling a stale window.
+    if (!configIsFresh && configMayBeStale()) {
+        // readConfig() still holds the old values, so the press waits for
+        // options.configChanged instead of toggling a stale window.
         notePendingPress(index);
         requestConfigReload();
         return;
     }
 
     if (!slotRegex[index]) {
-        // Disabled, empty or invalid slot: nothing to toggle.
-        info("slot " + (index + 1) + " is disabled or has no valid expression, nothing to toggle");
+        // Disabled, empty or invalid slot: nothing to toggle. Reported once per
+        // configuration generation, otherwise a forgotten slot fills the journal.
+        if (!inactiveSlotLogged[index]) {
+            inactiveSlotLogged[index] = true;
+            info("slot " + (index + 1) +
+                 " is disabled or has no valid expression, nothing to toggle");
+        }
         return;
     }
 
@@ -459,8 +537,10 @@ function toggleWindow(index, configIsFresh) {
         }
         break; // only toggle one window
     }
-    if (!matched) {
-        // The expression is valid, so a typo in it is the likely cause.
+    if (!matched && !unmatchedSlotLogged[index]) {
+        // The expression is valid, so a typo in it is the likely cause. Again
+        // once per configuration generation, not once per press.
+        unmatchedSlotLogged[index] = true;
         info("no window matches slot " + (index + 1));
     }
 }
@@ -563,11 +643,7 @@ function init() {
 
     // A settings window may already be open and focused when the script loads,
     // in which case its Apply must not be missed.
-    try {
-        settingsWindowSeen = isSettingsWindow(workspace.activeWindow);
-    } catch (error) {
-        warn("could not inspect the active window: " + error);
-    }
+    settingsWindowSeen = isSettingsWindow(currentActiveWindow());
 
     // Last statement: a re-entrant call must not register everything twice.
     initialized = true;

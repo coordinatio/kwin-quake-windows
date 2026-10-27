@@ -58,8 +58,10 @@ new values have arrived; that single press may be delayed by about 200 ms and at
 the reload within a second, the pending press is carried out anyway after re-reading the
 configuration one last time — a keypress is never lost.
 
-While the Configure dialog stays focused, every press is remembered and asks for a reload;
-KWin coalesces those requests, so at most one reconfigure happens per ~200 ms.
+While the Configure dialog stays focused, every press is remembered and asks for a reload.
+`requestConfigReload()` ignores a request while one is still pending, so presses spaced
+further apart each cost one reconfigure, and KWin itself runs at most one configure pass per
+~200 ms.
 
 Leaving System Settings triggers one KWin reconfigure even from an unrelated page, and so
 does closing `kcmshell6`: the script cannot tell which configuration module was open. That
