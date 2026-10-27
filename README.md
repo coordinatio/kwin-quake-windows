@@ -71,6 +71,11 @@ generic scripted configuration module writes the script's group without notifyin
 afterwards (upstream TODO). Scripts get no signal about their own configuration either, so
 the script infers it from window focus.
 
+A possible future optimisation is a script restart that reports its completion
+(`Scripting.start`): the script could then re-read its configuration once instead of
+inferring the reload from focus. Today that call only re-parses the script and reports
+nothing, so the inference above is what is left.
+
 * **On focus loss.** Activating a settings window sets a latch; activating a non-settings
   window with the latch set asks KWin to reconfigure through D-Bus
   (`org.kde.KWin.reconfigure`). KWin then emits `options.configChanged`, which is the moment
@@ -110,8 +115,9 @@ Known trade-offs:
   `settings` is treated as one too, which costs at most one deferred press and one extra
   reconfigure.
 * If the system cannot create a `QTimer` at all, there is no deadline, so a press with a
-  possibly stale configuration is toggled synchronously instead of waiting forever. That is
-  reported once in the journal.
+  possibly stale configuration is toggled synchronously instead of waiting forever. The
+  same fallback applies when the reconfigure request itself fails. That is reported once in
+  the journal.
 
 ### How a toggle changes window properties
 
@@ -182,18 +188,20 @@ name the same domain the catalog is loaded from.
 `./tests/run-kcm-test.sh` is the optional end-to-end check of the settings dialog: it builds
 `tests/kcm-test.cpp`, installs the package with `kpackagetool6` into a throw-away `XDG_DATA_HOME`
 and drives the real KCM (KConfigXT ↔ `config.ui` ↔ `[Script-quakewindows]` ↔ translations), first
-with `LANG=C.UTF-8` and then with `LANG=ru_RU.UTF-8` when that locale is installed. It needs
-`g++`, the Qt6/KF6 development headers, `kpackagetool6` and KWin's generic scripted configuration
-plugin; when any of them is missing it explains that and exits 0. Nothing is written outside its
-temporary directory.
+with `LANG=C.UTF-8` and then with `LANG=ru_RU.UTF-8` when that locale is installed. Each run also
+asserts the language of the intro label, so the translated form is not just exercised but
+checked. It needs `g++`, the Qt6/KF6 development headers, `kpackagetool6` and KWin's generic
+scripted configuration plugin; when any of them is missing it explains that and exits 0. Nothing
+is written outside its temporary directory.
 
 `./tests/run-script-engine-test.sh` is the optional check against a real script engine: it builds
 `tests/script-engine-test.cpp`, evaluates `contents/code/main.js` in a `QJSEngine` where
 `readConfig`, `registerShortcut`, `callDBus`, `console`, `workspace` and `options` are recording
 mocks and `QTimer` is the real Qt class KWin exposes, then presses the shortcuts, defers a press
 behind an active settings window, replays it through `options.configChanged` and waits for the
-actual timer to fire. It needs `g++`, `pkg-config`, `qmake6` (to locate `moc`) and the Qt6
-Core/Qml development files; when any of them is missing it explains that and exits 0.
+actual timer to fire — asserting that the replay happens within about 1 s of the deferral. It
+needs `g++`, `pkg-config`, `qmake6` (to locate `moc`) and the Qt6 Core/Qml development files;
+when any of them is missing it explains that and exits 0.
 
 ## Credits
 

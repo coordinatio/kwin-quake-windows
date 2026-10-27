@@ -19,11 +19,16 @@
 //       -lKF6KCMUtils -lKF6KCMUtilsCore -lKF6ConfigCore -lKF6ConfigGui \
 //       -lKF6ConfigWidgets -lKF6CoreAddons -lKF6WidgetsAddons \
 //       -lQt6Widgets -lQt6Gui -lQt6Core
+//
+// QUAKEWINDOWS_TEST_EXPECT_LANG selects the language the form has to show: "C"
+// for English, "ru" for the Russian catalog. Without it the language assertion is
+// skipped, so a manual run cannot fail for an environment reason.
 
 #include <QApplication>
 #include <QCheckBox>
 #include <QFile>
 #include <QLabel>
+#include <QLocale>
 #include <KCMultiDialog>
 #include <KCModule>
 #include <QLineEdit>
@@ -110,6 +115,34 @@ int main(int argc, char **argv)
 
     QWidget *configForm = form->findChild<QWidget *>(QStringLiteral("KWin::QuakeWindowsConfigForm"));
     check(configForm != nullptr, QStringLiteral("the configuration form KWin::QuakeWindowsConfigForm was loaded"));
+
+    // ---------------------------------------------------------- translated labels
+    //
+    // KLocalizedTranslator translates this form from the compiled catalog named by
+    // X-KWin-Config-TranslationDomain, so the intro label is the runtime proof that
+    // the catalog is found. The runner starts the test once per locale and says
+    // which language to expect through QUAKEWINDOWS_TEST_EXPECT_LANG; the Russian
+    // assertion is skipped when Qt did not pick the Russian language up, so it can
+    // never fail for an environment reason.
+    auto *intro = form->findChild<QLabel *>(QStringLiteral("introLabel"));
+    check(intro != nullptr, QStringLiteral("the intro label exists"));
+    const QString introText = intro ? intro->text() : QString();
+    const QString expectedLanguage = qEnvironmentVariable("QUAKEWINDOWS_TEST_EXPECT_LANG");
+    if (expectedLanguage == QLatin1String("ru")) {
+        if (QLocale::system().language() == QLocale::Russian) {
+            check(introText.startsWith(QStringLiteral("Показать")),
+                  QStringLiteral("the intro label is translated into Russian (got '%1')").arg(introText));
+        } else {
+            out << "SKIP: the Russian intro label is not checked, Qt did not pick ru_RU.UTF-8 up"
+                << Qt::endl;
+        }
+    } else if (expectedLanguage == QLatin1String("C")) {
+        check(introText.startsWith(QStringLiteral("Toggle any window")),
+              QStringLiteral("the intro label stays English under LANG=C.UTF-8 (got '%1')").arg(introText));
+    } else {
+        out << "SKIP: no language expectation was passed, the intro label is not checked"
+            << Qt::endl;
+    }
 
     auto edit = [form](int slot) {
         return form->findChild<QLineEdit *>(QStringLiteral("kcfg_WindowName%1").arg(slot));

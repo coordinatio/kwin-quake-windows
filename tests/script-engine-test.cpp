@@ -538,6 +538,8 @@ int main(int argc, char **argv)
         harness.load(source);
 
         harness.workspace.activate(settings);
+        QElapsedTimer deadline;
+        deadline.start();
         press(harness, 0);
         check(!terminal->minimized, QStringLiteral("the press waits for the deadline"));
 
@@ -549,6 +551,18 @@ int main(int argc, char **argv)
                   return late->minimized;
               }, 4000),
               QStringLiteral("the real 1 s timer fires and replays the pending press"));
+
+        // The bound is what makes a deadline regression visible: changing
+        // CONFIG_TIMEOUT_MS to 2000 ms would still replay the press, just too
+        // late, so the wait itself is measured. The lower bound catches a
+        // deadline that fires far too early.
+        const qint64 replayMs = deadline.elapsed();
+        check(replayMs < 1500,
+              QStringLiteral("the replay happens within 1.5 s of the deferral (took %1 ms)")
+                  .arg(replayMs));
+        check(replayMs >= 500,
+              QStringLiteral("the replay waits for a deadline of about 1 s (took %1 ms)")
+                  .arg(replayMs));
         check(!terminal->minimized,
               QStringLiteral("the re-read expression decided the replay, not the stale one"));
         check(harness.warnings().contains(QStringLiteral("did not confirm the configuration reload")),

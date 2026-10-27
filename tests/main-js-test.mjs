@@ -121,6 +121,9 @@ function createContext(state) {
             harness.shortcuts.push({ id, name, key, callback });
         },
         callDBus(a, b, c, d) {
+            if (state.dbusThrows) {
+                throw new Error('dbus is broken');
+            }
             // KWin drops error replies, so a failed request is simply silent.
             harness.dbus.push({ service: a, path: b, iface: c, method: d });
         },
@@ -165,13 +168,18 @@ function load(state) {
     const { context, config } = createContext(state);
     vm.createContext(context);
     if (state.throwInApplyConfig) {
-        // Every readConfig() access inside applyConfig() is guarded, so poisoning
-        // JSON.stringify is the only remaining way to make it throw. The guard in
-        // init() is what has to survive that.
-        context.JSON = {
-            stringify() {
-                throw new Error('poisoned JSON');
-            },
+        // readConfig() and the pattern compile are both guarded inside
+        // applyConfig(), so the first compiled pattern is the hook that can still
+        // make the generation-building loop throw: its `source` getter is read for
+        // the journal line. The guard in init() is what has to survive that.
+        const HostRegExp = RegExp;
+        let constructed = 0;
+        context.RegExp = function (pattern) {
+            constructed += 1;
+            if (constructed === 1) {
+                return { get source() { throw new Error('broken generation'); } };
+            }
+            return new HostRegExp(pattern);
         };
     }
     if (state.failTimerCreation) {
@@ -279,7 +287,7 @@ function pendingIndexes(context) {
     const { context } = load({ WindowName1: '^quake$', throwInApplyConfig: true });
 
     check(() => {
-        assert.match(harness.warnings.join('\n'), /failed to apply configuration: .*poisoned JSON/);
+        assert.match(harness.warnings.join('\n'), /failed to apply configuration: .*broken generation/);
         assert.equal(harness.shortcuts.length, 7, 'the shortcuts are registered anyway');
         assert.equal(context.workspace.currentDesktopChanged.fns.length, 1,
             'currentDesktopChanged is connected anyway');
@@ -301,6 +309,31 @@ function pendingIndexes(context) {
 }
 
 // ================================ 1c. a failing applyConfig() commits nothing (finding 3)
+//
+// applyConfig() compiles slot by slot and commits only after the loop finished.
+// The throw has to happen inside that loop: readConfig() and the compile are
+// guarded, so a throw before the loop can only be produced by shadowing a global
+// such as Array.prototype.join, which would replace the code path under test. The
+// snapshot below is therefore taken mid-loop, after the first slot of the failing
+// generation was compiled.
+function generationSnapshot(context) {
+    return {
+        signature: context.configSignature,
+        compiled: context.slotRegex,
+        active: context.activeSlots,
+        logged: context.inactiveSlotLogged,
+    };
+}
+
+function assertGenerationIntact(context, before) {
+    assert.equal(context.configSignature, before.signature,
+        'the broken generation is not marked as applied');
+    assert.equal(context.slotRegex, before.compiled, 'the compiled slots are untouched');
+    assert.equal(context.activeSlots, before.active, 'the active slots are untouched');
+    assert.equal(context.inactiveSlotLogged, before.logged,
+        'the "logged once" memory of the applied generation survives');
+}
+
 {
     const window1 = makeWindow('quake');
     const { context, config } = load({
@@ -315,14 +348,12 @@ function pendingIndexes(context) {
         harness.shortcuts[2].callback();
         assert.match(harness.infos.join('\n'), /slot 3 is disabled or has no valid expression/);
 
-        const signature = context.configSignature;
-        const compiled = context.slotRegex;
-        const active = context.activeSlots;
-        const logged = context.inactiveSlotLogged;
-        assert.notEqual(signature, null, 'the first generation was applied');
+        const before = generationSnapshot(context);
+        assert.notEqual(before.signature, null, 'the first generation was applied');
 
         // The second pattern compiles, but building its journal line explodes, so
-        // applyConfig() throws in the middle of the loop.
+        // applyConfig() throws in the middle of the loop, after the first slot of
+        // the new generation was compiled and pushed.
         // The host constructor: a vm context does not expose its intrinsics as
         // properties of the sandbox object, so the spy needs one from outside.
         const HostRegExp = RegExp;
@@ -340,37 +371,34 @@ function pendingIndexes(context) {
         assert.doesNotThrow(() => emitConfigChanged(context));
         assert.match(harness.warnings[warningsBefore],
             /failed to apply configuration: .*broken generation/);
-        assert.equal(context.configSignature, signature,
-            'the broken generation is not marked as applied');
-        assert.equal(context.slotRegex, compiled, 'the compiled slots are untouched');
-        assert.equal(context.activeSlots, active, 'the active slots are untouched');
-        assert.equal(context.inactiveSlotLogged, logged,
-            'the "logged once" memory of the applied generation survives');
+        assert.equal(constructed, 2,
+            'the throw happened in the loop, after the first slot compiled');
+        assertGenerationIntact(context, before);
 
         // The same generation is still in force, so the unusable slot stays quiet.
-        const before = harness.infos.length;
+        const beforeInfo = harness.infos.length;
         harness.shortcuts[2].callback();
-        assert.equal(harness.infos.length, before, 'the slot is not reported a second time');
+        assert.equal(harness.infos.length, beforeInfo, 'the slot is not reported a second time');
 
         // Once applyConfig() can run again the new generation is committed as a
         // whole and the "logged once" memory starts over.
         delete context.RegExp;
         emitConfigChanged(context);
-        assert.notEqual(context.configSignature, signature, 'the new generation is applied');
-        assert.notEqual(context.slotRegex, compiled, 'the compiled slots were replaced');
+        assert.notEqual(context.configSignature, before.signature, 'the new generation is applied');
+        assert.notEqual(context.slotRegex, before.compiled, 'the compiled slots were replaced');
         assert.match(harness.infos.join('\n'), /active slots: 1: \^renamed\$/);
         const after = harness.infos.length;
         harness.shortcuts[2].callback();
         assert.match(harness.infos.slice(after).join('\n'),
             /slot 3 is disabled or has no valid expression/,
             'a new generation reports the unusable slot again');
-    }, 'an applyConfig() that throws mid-loop commits nothing and keeps the old generation');
+    }, 'an applyConfig() that throws while building a journal line commits nothing and keeps the old generation');
 }
 
 // ===================== 1d. a configuration change must not re-register (finding 6)
 //
-// The original implementation called init() again from options.configChanged,
-// which registered every shortcut a second time and doubled the signal handlers.
+// Registering again on every options.configChanged would double the shortcuts and
+// the signal handlers, so both counts are checked after two configuration changes.
 {
     const { context, config } = load({ WindowName1: '^quake$' });
 
@@ -1000,9 +1028,8 @@ function pendingIndexes(context) {
 
 // ===================================== 6. the configuration deadline (finding 4)
 //
-// One timer now answers both questions the old pair answered: a deferred press
-// always has a deadline, and an unanswered reload request cannot latch. Both
-// paths are driven through this single timer.
+// One timer answers both questions: a deferred press always has a deadline, and
+// an unanswered reload request cannot latch. Both paths are driven through it.
 {
     const window1 = makeWindow('first title');
     const { context } = load({ WindowName1: '^first title$', windows: [window1] });
@@ -1069,7 +1096,7 @@ function pendingIndexes(context) {
         const warnings = harness.warnings.join('\n');
         assert.match(warnings, /could not create the configuration timer/);
         assert.match(warnings,
-            /no configuration timer is available, toggling with the configuration as it is/);
+            /could not defer the press until the configuration is reloaded/);
         assert.equal(window1.minimized, true,
             'the press toggles synchronously instead of being lost');
         assert.deepEqual(pendingIndexes(context), [],
@@ -1106,6 +1133,64 @@ function pendingIndexes(context) {
     }, 'a latched reload request without a timer is cleared by configChanged');
 }
 
+// ====== 6c. a throwing callDBus must not strand the press (finding 1)
+//
+// requestConfigReload() disarms the deadline it just armed when the D-Bus call
+// throws, so "is there a timer object?" is not the question toggleWindow() may
+// ask. It branches on what the request reports instead.
+{
+    const window1 = makeWindow('first title');
+    const { context } = load({
+        WindowName1: '^first title$',
+        windows: [window1],
+        dbusThrows: true,
+    });
+
+    check(() => {
+        activate(context, settingsWindow());
+        assert.doesNotThrow(() => harness.shortcuts[0].callback(),
+            'the press does not escape into KWin');
+        assert.equal(window1.minimized, true,
+            'the press toggles even though the reload request threw');
+        assert.deepEqual(pendingIndexes(context), [],
+            'the parity flip is undone, nothing stays queued');
+        assert.equal(context.awaitingConfig, false, 'no reload is left pending');
+        assert.equal(reconfigureCalls().length, 0, 'the request never reached KWin');
+        const warnings = harness.warnings.join('\n');
+        assert.match(warnings,
+            /could not ask KWin to reload its configuration: .*dbus is broken/);
+        assert.match(warnings,
+            /could not defer the press until the configuration is reloaded/);
+
+        // The deadline the request armed was stopped again, so no timeout can
+        // replay a press that was already carried out.
+        const timer = context.configTimer;
+        assert.ok(timer instanceof MockTimer, 'the request did create a deadline');
+        assert.equal(timer.running, false, 'the failed request disarmed it');
+        assert.equal(timer.fire(), false, 'a stopped deadline delivers nothing');
+        assert.equal(window1.minimized, true, 'the window is not toggled a second time');
+    }, 'a throwing callDBus falls back to a synchronous toggle instead of stranding the press');
+
+    check(() => {
+        const warningsBefore = harness.warnings.length;
+        harness.shortcuts[0].callback();
+        assert.equal(window1.minimized, false, 'the next press toggles back');
+        assert.deepEqual(pendingIndexes(context), [], 'still nothing is queued');
+
+        // Restoring the window activates it, so the focus change asks for a
+        // reload too; both failures come from the same throwing callDBus.
+        const fresh = harness.warnings.slice(warningsBefore);
+        assert.ok(fresh.length > 0, 'the failing request is reported again');
+        for (const line of fresh) {
+            assert.match(line, /could not ask KWin to reload its configuration/,
+                'only the D-Bus failure is reported, not the once-only fallback');
+        }
+        assert.equal(harness.warnings.filter((line) =>
+            /could not defer the press/.test(line)).length, 1,
+            'the fallback is logged once, not on every press');
+    }, 'the throwing-request fallback is logged once and keeps toggling');
+}
+
 // ===================================== 7. an already active settings window (finding 5)
 {
     const { context } = load({ windows: [], activeWindow: settingsWindow() });
@@ -1125,34 +1210,102 @@ function pendingIndexes(context) {
     }, 'leaving the already-active settings window requests one reload');
 }
 
-// ================================================ 8. handler guards (finding 5)
+// ================================= 8. per-window property guards (finding 2)
+//
+// A Client wrapper whose window is being destroyed throws on every property read
+// and write, so one such window must not swallow a press or abort a loop over
+// workspace.windowList(). Every read goes through clientRead()/clientText() and
+// every write through clientWrite(), both of which degrade to "no value".
 {
-    const explodes = () => {
-        throw new Error('dead window');
+    const goingAway = () => {
+        throw new Error('window is going away');
     };
-    const dying = { minimized: false };
-    Object.defineProperty(dying, 'resourceClass', { get: explodes });
-    Object.defineProperty(dying, 'resourceName', { get: explodes });
-    dying.caption = 'dying';
-
-    const { context } = load({ WindowName1: 'dying', windows: [dying] });
 
     check(() => {
-        assert.doesNotThrow(() => activate(context, dying),
-            'a throwing property access does not escape into KWin');
-        assert.match(harness.warnings.join('\n'), /failed to handle a window activation/);
-        assert.equal(context.settingsWindowSeen, false);
-    }, 'the windowActivated wrapper catches a failing property access and warns');
+        const dying = makeWindow('quake');
+        Object.defineProperty(dying, 'caption', { get: goingAway });
+        const healthy = makeWindow('quake');
+        load({ WindowName1: '^quake$', windows: [dying, healthy] });
+
+        assert.doesNotThrow(() => harness.shortcuts[0].callback(),
+            'the press does not escape into KWin');
+        assert.equal(healthy.minimized, true,
+            'the window after the dying one is toggled');
+        assert.equal(harness.warnings.length, 0,
+            'a guarded read is not reported as an error');
+    }, 'a window whose caption getter throws is skipped and the next window still toggles');
 
     check(() => {
-        const explodingCaption = makeWindow('x');
-        Object.defineProperty(explodingCaption, 'caption', { get: explodes });
-        context.workspace.windows = [explodingCaption];
+        // The same window during a window activation: the settings-window
+        // heuristic must not throw on an unreadable resourceClass/resourceName.
+        const dying = makeWindow('Settings', { resourceClass: 'systemsettings' });
+        Object.defineProperty(dying, 'resourceClass', { get: goingAway });
+        Object.defineProperty(dying, 'resourceName', { get: goingAway });
+        const { context } = load({ windows: [] });
+
+        assert.doesNotThrow(() => activate(context, dying));
+        assert.equal(context.settingsWindowSeen, false,
+            'an unreadable class does not look like a settings window');
+        assert.equal(harness.warnings.length, 0, 'nothing warns about it');
+    }, 'a window whose resourceClass getter throws is not treated as a settings window');
+
+    check(() => {
+        const dying = makeWindow('quake');
+        dying.minimized = true;
+        Object.defineProperty(dying, 'caption', { get: goingAway });
+        const healthy = makeWindow('quake');
+        healthy.minimized = true;
+        const { context } = load({ WindowName1: '^quake$', windows: [dying, healthy] });
+        healthy.skipTaskbar = false;
+
         assert.doesNotThrow(() => {
             context.workspace.currentDesktopChanged.fns.forEach((fn) => fn(null, null));
-        }, 'a throwing property access does not escape into KWin');
-        assert.match(harness.warnings.join('\n'), /failed to handle a desktop change/);
-    }, 'the currentDesktopChanged wrapper catches a failing property access and warns');
+        }, 'the desktop change does not escape into KWin');
+        assert.equal(healthy.skipTaskbar, true,
+            'the fixup still reaches the window after the dying one');
+        assert.equal(dying.skipTaskbar, false, 'the dying window is left alone');
+        assert.equal(harness.warnings.length, 0, 'a guarded read is not an error');
+    }, 'a window whose caption getter throws does not abort the desktop-change fixup');
+
+    check(() => {
+        const dying = makeWindow('quake');
+        dying.minimized = true;
+        Object.defineProperty(dying, 'skipTaskbar', { set: goingAway });
+        const healthy = makeWindow('quake');
+        healthy.minimized = true;
+        const { context } = load({ WindowName1: '^quake$', windows: [dying, healthy] });
+        healthy.skipTaskbar = false;
+
+        assert.doesNotThrow(() => context.workspace.currentDesktopChanged.fns[0](null, null));
+        assert.equal(healthy.skipTaskbar, true,
+            'the loop continues after the failed write');
+        assert.equal(harness.warnings.length, 0, 'a guarded write is not an error');
+    }, 'a window whose skipTaskbar setter throws does not abort the desktop-change fixup');
+
+    check(() => {
+        const dying = makeWindow('quake');
+        Object.defineProperty(dying, 'minimized', {
+            get() {
+                return false;
+            },
+            set: goingAway,
+        });
+        const other = makeWindow('other');
+        const { context } = load({
+            WindowName1: '^quake$',
+            WindowName2: '^other$',
+            windows: [dying, other],
+        });
+
+        assert.doesNotThrow(() => harness.shortcuts[0].callback(),
+            'a failing flag write does not escape into KWin');
+        assert.match(harness.warnings.join('\n'),
+            /could not set the toggle flags of a window matching slot 1/);
+        assert.equal(other.minimized, false, 'the dying window was not replaced by another one');
+
+        harness.shortcuts[1].callback();
+        assert.equal(other.minimized, true, 'the next press still works');
+    }, 'a window whose minimized setter throws does not escape into KWin');
 }
 
 // ================================================== 9. the deadline replays a press

@@ -136,9 +136,14 @@ fi
 # --------------------------------------------------------------- one locale run
 # Each run gets its own XDG tree: the test applies changes and finally presses
 # Defaults, so the kwinrc fixture has to start from scratch every time.
+# The third argument is the language the test has to see in the form: "C" for
+# English, "ru" for the Russian catalog. The test skips the Russian assertion
+# itself when Qt did not pick the locale up, so an installed-locale check here is
+# enough.
 run_locale() {
     local lang="$1"
     local tag="$2"
+    local expect="$3"
     local root="$work/$tag"
 
     mkdir -p "$root/data" "$root/config" "$root/cache" "$root/run" "$root/home"
@@ -168,16 +173,17 @@ EOF
     echo "==> running the KCM test with LANG=$lang"
     XDG_DATA_HOME="$root/data" XDG_CONFIG_HOME="$root/config" \
         XDG_CACHE_HOME="$root/cache" XDG_RUNTIME_DIR="$root/run" HOME="$root/home" \
+        QUAKEWINDOWS_TEST_EXPECT_LANG="$expect" \
         QT_QPA_PLATFORM=offscreen LANG="$lang" LC_ALL="$lang" \
         "$work/build/kcm-test"
 }
 
 status=0
-run_locale "C.UTF-8" "c" || status=1
+run_locale "C.UTF-8" "c" "C" || status=1
 
 # The Russian run is only meaningful when the locale exists on this machine.
 if [ "$status" -eq 0 ] && locale -a 2>/dev/null | grep -qi '^ru_RU'; then
-    run_locale "ru_RU.UTF-8" "ru" || status=1
+    run_locale "ru_RU.UTF-8" "ru" "ru" || status=1
 elif [ "$status" -eq 0 ]; then
     echo "==> skipping the ru_RU.UTF-8 run: the locale is not installed here"
 fi

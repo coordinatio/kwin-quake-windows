@@ -26,12 +26,12 @@
 
 var SLOT_COUNT = 7;
 
-// The one deadline of the configuration machinery. It encodes both guarantees
-// the old pair of timers carried: every deferred press has a deadline, and a
-// reload request that KWin never answers cannot latch, because callDBus() drops
-// error replies and a timeout is the only way out. The request and every deferred
-// press re-arm it, so it fires CONFIG_TIMEOUT_MS after the last event that needed
-// it, and whichever of the two happened last is handled by the same handler.
+// The one deadline of the configuration machinery. It carries two guarantees:
+// every deferred press has a deadline, and a reload request that KWin never
+// answers cannot latch, because callDBus() drops error replies and a timeout is
+// the only way out. The request and every deferred press re-arm it, so it fires
+// CONFIG_TIMEOUT_MS after the last event that needed it, and whichever of the two
+// happened last is handled by the same handler.
 var CONFIG_TIMEOUT_MS = 1000;
 
 var slotRegex = [];
@@ -69,13 +69,13 @@ var pendingPresses = [];
 // created lazily. It dies with the script: KWin owns the QJSEngine, objects
 // created in JavaScript have JavaScript ownership, so destroying the engine
 // destroys the timer - there is no unload hook to worry about. The handler stays
-// defensive anyway (a timeout can arrive half-way through a reload, and creating
-// the timer can fail), which costs a handful of lines.
+// defensive anyway: a timeout can arrive half-way through a reload, and creating
+// the timer can fail.
 var configTimer = null;
 
-// The "no timer at all" fallback below is worth exactly one journal line: if
-// QTimer cannot be created, every press would otherwise repeat it.
-var noTimerFallbackLogged = false;
+// Toggling without waiting is worth exactly one journal line: a press that cannot
+// be deferred would otherwise repeat the warning on every keypress.
+var deferralFallbackLogged = false;
 
 // Creating the timer failed once already. QTimer does not start working later in
 // a session, so the attempt and its warning are not repeated.
@@ -105,6 +105,60 @@ function info(message) {
  */
 function text(value) {
     return typeof value === "string" ? value : "";
+}
+
+/**
+ * Reads one property of a client. A Client wrapper whose window is being
+ * destroyed throws on every property read, and one such window must neither
+ * swallow a press nor abort a loop over workspace.windowList(), so a failed read
+ * is treated as an absent value.
+ */
+function clientRead(client, name, fallback) {
+    if (!client) {
+        return fallback;
+    }
+    try {
+        return client[name];
+    } catch (error) {
+        return fallback;
+    }
+}
+
+/** A string property of a client: "" when it is missing or unreadable. */
+function clientText(client, name) {
+    return text(clientRead(client, name, ""));
+}
+
+/**
+ * Writes one flag of a client. Returns false when the write throws, which is what
+ * a window being destroyed does; the caller then skips that window instead of
+ * letting the exception escape into the other windows of the list.
+ */
+function clientWrite(client, name, value) {
+    if (!client) {
+        return false;
+    }
+    try {
+        client[name] = value;
+        return true;
+    } catch (error) {
+        return false;
+    }
+}
+
+/**
+ * Sets every toggle flag of one window. Returns false as soon as a write throws:
+ * the window is going away, so the remaining flags and the activation are
+ * pointless, but the press itself must not fail because of it.
+ */
+function setToggleFlags(client, hidden) {
+    var names = ["onAllDesktops", "minimized", "skipTaskbar", "skipPager", "skipSwitcher"];
+    for (var index = 0; index < names.length; ++index) {
+        if (!clientWrite(client, names[index], hidden)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 function readString(key, fallback) {
@@ -174,11 +228,24 @@ function compilePattern(pattern, index) {
 }
 
 /**
+ * A compact signature of the stored slots: the enable flag and the pattern of
+ * every slot, joined with NUL bytes, which neither of them can contain. Built by
+ * hand so applyConfig() does not depend on a global another script could shadow.
+ */
+function slotSignature(raw) {
+    var parts = [];
+    for (var index = 0; index < SLOT_COUNT; ++index) {
+        parts.push(raw[index].enabled ? "1" : "0", raw[index].pattern);
+    }
+    return parts.join("\u0000");
+}
+
+/**
  * Re-reads the seven slots and recompiles them when the stored values changed.
  */
 function applyConfig() {
     var raw = readRawSlots();
-    var signature = JSON.stringify(raw);
+    var signature = slotSignature(raw);
     if (signature === configSignature) {
         return;
     }
@@ -211,9 +278,9 @@ function windowClass(client) {
     if (!client) {
         return "";
     }
-    var name = text(client.resourceClass);
+    var name = clientText(client, "resourceClass");
     if (!name) {
-        name = text(client.resourceName);
+        name = clientText(client, "resourceName");
     }
     return name.toLowerCase();
 }
@@ -254,9 +321,11 @@ function isSettingsWindow(client) {
 
 /**
  * workspace.activeWindow itself does not throw; what throws is a property read on
- * the wrapper of a window that is being destroyed (see windowClass()). The value
- * is fetched here and every read of it stays guarded, because no press handling
- * may break on a dying window; the try/catch is the last line of defence only.
+ * the wrapper of a window that is being destroyed, and those reads are guarded
+ * one by one (clientRead() and its callers). This try/catch only covers the
+ * property access on the workspace object itself, where an unexpected error
+ * would otherwise escape into KWin; it is the last line of defence, not the
+ * guard that protects a dying window.
  */
 function currentActiveWindow() {
     try {
@@ -270,10 +339,13 @@ function currentActiveWindow() {
 /**
  * True when readConfig() may still return the values from before the settings
  * dialog was used, so a press has to wait for options.configChanged instead of
- * toggling a window from a stale configuration. Three independent reasons: a
- * reload was requested and not confirmed yet, the dialog was activated since the
- * last reload, or the dialog is focused right now (it stays focused across a
- * reload, so a second Apply has to be noticed too).
+ * toggling a window from a stale configuration. Two reasons are tracked
+ * explicitly: a reload was requested and not confirmed yet, and the dialog was
+ * activated since the last reload (onConfigChanged() rebuilds that latch from the
+ * active window, so a second Apply while the dialog stays focused is already
+ * covered by it). The third check - is a settings window focused right now - is a
+ * cheap safety net for an activation that never reached the script; it is not
+ * what catches the second Apply.
  */
 function configMayBeStale() {
     if (awaitingConfig || settingsWindowSeen) {
@@ -286,10 +358,17 @@ function configMayBeStale() {
  * Asks KWin to re-read kwinrc. KWin coalesces reconfigure requests with its own
  * 200 ms timer, so there is no point in debouncing here; the shared deadline is
  * only about the answer, not about the request.
+ *
+ * Returns true when a deferred press may wait: a reload is pending and something
+ * will end the wait, either the answer or the deadline. Returns false when
+ * waiting would strand the press - the call threw, or no QTimer can be created
+ * here - so the caller has to toggle synchronously instead.
  */
 function requestConfigReload() {
     if (awaitingConfig) {
-        return;
+        // A request is already in flight: the press waits for the same answer and
+        // shares the same deadline, which exists unless no timer could be made.
+        return configDeadline() !== null;
     }
     awaitingConfig = true;
     armConfigTimer();
@@ -302,7 +381,13 @@ function requestConfigReload() {
         awaitingConfig = false;
         stopConfigTimer();
         warn("could not ask KWin to reload its configuration: " + error);
+        // No reload is pending any more, so a deferred press has nothing left to
+        // wait for.
+        return false;
     }
+    // The request survived, but waiting still needs a deadline: without a timer
+    // only options.configChanged could end the wait, and it may never come.
+    return configDeadline() !== null;
 }
 
 /**
@@ -371,6 +456,14 @@ function notePendingPress(index) {
     // leave the window in the opposite state.
     pendingPresses[index] = !pendingPresses[index];
     armConfigTimer();
+}
+
+/**
+ * Undoes notePendingPress() when the press is not deferred after all, so the
+ * parity bit does not stay queued for a replay that should not happen.
+ */
+function clearPendingPress(index) {
+    pendingPresses[index] = !pendingPresses[index];
 }
 
 function hasPendingPresses() {
@@ -517,7 +610,7 @@ function isRelevant(client, index) {
     if (!regex || !client) {
         return false;
     }
-    var caption = text(client.caption);
+    var caption = clientText(client, "caption");
     if (!caption) {
         return false;
     }
@@ -533,18 +626,18 @@ function toggleWindow(index, configIsFresh) {
         // readConfig() still holds the old values, so the press waits for
         // options.configChanged instead of toggling a stale window.
         notePendingPress(index);
-        requestConfigReload();
-        if (configTimer) {
+        if (requestConfigReload()) {
             return;
         }
-        // Neither the press nor the reload request got a deadline, so waiting
-        // would mean waiting forever. A toggle with a possibly stale
-        // configuration beats a press that never happens: undo the parity flip
-        // just made, say so once and fall through to the synchronous path.
-        pendingPresses[index] = !pendingPresses[index];
-        if (!noTimerFallbackLogged) {
-            noTimerFallbackLogged = true;
-            warn("no configuration timer is available, toggling with the configuration as it is");
+        // The request failed or got no deadline, so waiting would mean waiting
+        // forever. A toggle with a possibly stale configuration beats a press
+        // that never happens: undo the parity flip just made, say so once and
+        // fall through to the synchronous path.
+        clearPendingPress(index);
+        if (!deferralFallbackLogged) {
+            deferralFallbackLogged = true;
+            warn("could not defer the press until the configuration is reloaded, " +
+                 "toggling with the configuration as it is");
         }
     }
 
@@ -562,18 +655,20 @@ function toggleWindow(index, configIsFresh) {
     var allClients = workspace.windowList();
     var matched = false;
     for (var i = 0; i < allClients.length; ++i) {
-        if (!isRelevant(allClients[i], index)) {
+        var client = allClients[i];
+        if (!isRelevant(client, index)) {
             continue;
         }
         matched = true;
-        var prevMini = allClients[i].minimized;
-        allClients[i].onAllDesktops = !prevMini;
-        allClients[i].minimized = !prevMini;
-        allClients[i].skipTaskbar = !prevMini;
-        allClients[i].skipPager = !prevMini;
-        allClients[i].skipSwitcher = !prevMini;
+        var prevMini = clientRead(client, "minimized", false);
+        if (!setToggleFlags(client, !prevMini)) {
+            // A window that throws on a flag write is going away; the press must
+            // not turn into an error because of it.
+            warn("could not set the toggle flags of a window matching slot " + (index + 1));
+            break;
+        }
         if (prevMini) {
-            workspace.activeWindow = allClients[i];
+            workspace.activeWindow = client;
         }
         break; // only toggle one window
     }
@@ -594,11 +689,13 @@ function onCurrentDesktopChanged(previousDesktop, newDesktop) {
     // on the taskbar on desktop change.
     var allClients = workspace.windowList();
     for (var i = 0; i < allClients.length; ++i) {
+        var client = allClients[i];
         for (var j = 0; j < activeSlots.length; ++j) {
-            if (isRelevant(allClients[i], activeSlots[j])) {
+            if (isRelevant(client, activeSlots[j])) {
                 // Assigning the same value twice is pointless, so the first
-                // matching slot decides for this window.
-                allClients[i].skipTaskbar = allClients[i].minimized;
+                // matching slot decides for this window. A window that is going
+                // away is skipped here and the rest of the list is still fixed up.
+                clientWrite(client, "skipTaskbar", clientRead(client, "minimized", false));
                 break;
             }
         }
