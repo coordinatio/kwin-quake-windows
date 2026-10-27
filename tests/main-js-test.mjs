@@ -19,6 +19,8 @@ const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SOURCE_PATH = fileURLToPath(new URL('../contents/code/main.js', import.meta.url));
 const MAIN_XML_PATH = path.join(REPO_ROOT, 'contents/config/main.xml');
 const CONFIG_UI_PATH = path.join(REPO_ROOT, 'contents/ui/config.ui');
+const POT_PATH = path.join(REPO_ROOT, 'po/quakewindows.pot');
+const METADATA_PATH = path.join(REPO_ROOT, 'metadata.json');
 const SOURCE = fs.readFileSync(SOURCE_PATH, 'utf8');
 
 let failures = 0;
@@ -183,8 +185,24 @@ function watchdogTimer(context) {
     return context.configWatchdogTimer;
 }
 
-function activate(context, client) {
+// KWin makes the new window active before it emits windowActivated, so the mock
+// does the same: the handler always observes the client it is told about through
+// workspace.activeWindow. That is what exercises configMayBeStale()'s
+// isSettingsWindow(currentActiveWindow()) branch.
+//
+// deliver: false only records the active window, for the cases where the script
+// does not see the activation signal (KWin drops it for the window that was
+// already active, for example).
+function activate(context, client, { deliver = true } = {}) {
+    context.workspace._activeWindow = client;
+    if (!deliver) {
+        return;
+    }
     context.workspace.windowActivated.fns.forEach((fn) => fn(client));
+}
+
+function setActive(context, client) {
+    activate(context, client, { deliver: false });
 }
 
 function emitConfigChanged(context) {
@@ -256,6 +274,73 @@ function pendingIndexes(context) {
             'a configuration change does not escape into KWin');
         assert.match(harness.warnings.join('\n'), /failed to apply configuration/);
     }, 'after the failed init the script stays inert but guarded');
+}
+
+// ================================ 1c. a failing applyConfig() commits nothing (finding 3)
+{
+    const window1 = makeWindow('quake');
+    const { context, config } = load({
+        WindowName1: '^quake$',
+        WindowName2: '^other$',
+        windows: [window1],
+    });
+
+    check(() => {
+        // Slot 3 is unusable, so the "logged once" memory is filled before the
+        // failing generation.
+        harness.shortcuts[2].callback();
+        assert.match(harness.infos.join('\n'), /slot 3 is disabled or has no valid expression/);
+
+        const signature = context.configSignature;
+        const compiled = context.slotRegex;
+        const active = context.activeSlots;
+        const logged = context.inactiveSlotLogged;
+        assert.notEqual(signature, null, 'the first generation was applied');
+
+        // The second pattern compiles, but building its journal line explodes, so
+        // applyConfig() throws in the middle of the loop.
+        // The host constructor: a vm context does not expose its intrinsics as
+        // properties of the sandbox object, so the spy needs one from outside.
+        const HostRegExp = RegExp;
+        let constructed = 0;
+        context.RegExp = function (pattern) {
+            constructed += 1;
+            if (constructed === 2) {
+                return { get source() { throw new Error('broken generation'); } };
+            }
+            return new HostRegExp(pattern);
+        };
+
+        config.WindowName1 = '^renamed$';
+        const warningsBefore = harness.warnings.length;
+        assert.doesNotThrow(() => emitConfigChanged(context));
+        assert.match(harness.warnings[warningsBefore],
+            /failed to apply configuration: .*broken generation/);
+        assert.equal(context.configSignature, signature,
+            'the broken generation is not marked as applied');
+        assert.equal(context.slotRegex, compiled, 'the compiled slots are untouched');
+        assert.equal(context.activeSlots, active, 'the active slots are untouched');
+        assert.equal(context.inactiveSlotLogged, logged,
+            'the "logged once" memory of the applied generation survives');
+
+        // The same generation is still in force, so the unusable slot stays quiet.
+        const before = harness.infos.length;
+        harness.shortcuts[2].callback();
+        assert.equal(harness.infos.length, before, 'the slot is not reported a second time');
+
+        // Once applyConfig() can run again the new generation is committed as a
+        // whole and the "logged once" memory starts over.
+        delete context.RegExp;
+        emitConfigChanged(context);
+        assert.notEqual(context.configSignature, signature, 'the new generation is applied');
+        assert.notEqual(context.slotRegex, compiled, 'the compiled slots were replaced');
+        assert.match(harness.infos.join('\n'), /active slots: 1: \^renamed\$/);
+        const after = harness.infos.length;
+        harness.shortcuts[2].callback();
+        assert.match(harness.infos.slice(after).join('\n'),
+            /slot 3 is disabled or has no valid expression/,
+            'a new generation reports the unusable slot again');
+    }, 'an applyConfig() that throws mid-loop commits nothing and keeps the old generation');
 }
 
 // ====================================================== 2. matching / enabled flags
@@ -561,13 +646,19 @@ function pendingIndexes(context) {
     }, 'options.configChanged replays the pending press with the fresh configuration');
 
     check(() => {
-        // The reload completed, so the latch is cleared and leaving the dialog
-        // has nothing left to reload.
+        // The replay happened while the dialog was still focused, so the latch
+        // survived the reload: it only means "the dialog is still up".
         activate(context, window1);
-        assert.equal(context.settingsWindowSeen, false);
-        assert.equal(reconfigureCalls().length, 1,
-            'a focus change after a completed reload does not ask for another one');
+        assert.equal(context.settingsWindowSeen, false,
+            'the focus change clears the latch');
+        assert.equal(reconfigureCalls().length, 2,
+            'the dialog is gone now, so its Apply is picked up by one reload');
+        assert.equal(context.awaitingConfig, true);
+
+        emitConfigChanged(context);
         assert.equal(context.awaitingConfig, false);
+        assert.equal(context.settingsWindowSeen, false,
+            'a reload landing with a normal window focused keeps the latch cleared');
 
         harness.shortcuts[0].callback();
         assert.equal(second.minimized, false, 'the press toggles back synchronously');
@@ -620,14 +711,13 @@ function pendingIndexes(context) {
             'replaying a press must not request another reload');
         assert.equal(context.awaitingConfig, false);
         assert.equal(context.replaying, false, 'the replay flag is cleared by finally');
-        assert.equal(context.settingsWindowSeen, false,
-            'the reload cleared the latch: the dialog was not used since then');
+        assert.equal(context.settingsWindowSeen, true,
+            'the reload keeps the latch: the dialog is still focused, another Apply may come');
     }, 'a replayed press does not request a second configuration reload');
 
     check(() => {
         // The dialog is focused again and the user pressed OK a second time. The
-        // latch is gone, but the active window decides on its own that the
-        // configuration may be stale, so the press is still deferred.
+        // latch survived the first reload, so it catches this press on its own.
         activate(context, settingsWindow());
         harness.shortcuts[0].callback();
         assert.equal(window1.minimized, false, 'the press is deferred again');
@@ -635,6 +725,33 @@ function pendingIndexes(context) {
         assert.equal(reconfigureCalls().length, 2, 'and it asks for a reload');
         assert.equal(context.awaitingConfig, true);
     }, 'a second Apply is still detected while the dialog stays focused');
+}
+
+// ============== 5f. a focused settings window defers a press on its own (finding 1)
+{
+    const window1 = makeWindow('first title');
+    const other = makeWindow('other');
+    const { context } = load({ WindowName1: '^first title$', windows: [window1] });
+
+    check(() => {
+        // A reload lands with a normal window focused, so the latch is cleared.
+        activate(context, settingsWindow());
+        activate(context, other);
+        emitConfigChanged(context);
+        assert.equal(context.settingsWindowSeen, false, 'the latch is cleared');
+        assert.equal(context.awaitingConfig, false);
+
+        // Now a settings window is the active one again without an activation
+        // event reaching the script, so the latch stays false and only
+        // isSettingsWindow(currentActiveWindow()) can see the dialog.
+        setActive(context, settingsWindow());
+        assert.equal(context.settingsWindowSeen, false, 'no signal, so no latch');
+
+        harness.shortcuts[0].callback();
+        assert.equal(window1.minimized, false, 'the press is deferred nonetheless');
+        assert.deepEqual(pendingIndexes(context), [0], 'and it is remembered');
+        assert.equal(reconfigureCalls().length, 2, 'the press asks for a reload itself');
+    }, 'a press while a settings window is focused is deferred even when the latch is cleared');
 }
 
 // ============================ 5c. the settings latch heals itself (finding 2)
@@ -654,17 +771,24 @@ function pendingIndexes(context) {
         assert.equal(reconfigureCalls().length, 1, 'and it pays exactly one reconfigure');
 
         emitConfigChanged(context);
-        assert.equal(context.settingsWindowSeen, false,
-            'the reload clears "the dialog was used since the last reload"');
         assert.equal(window1.minimized, true, 'the deferred press is replayed');
-    }, 'a latched settings flag costs one reconfigure and is cleared by the reload');
+        assert.equal(context.settingsWindowSeen, true,
+            'the reload keeps the latch: the dialog is still the active window');
+    }, 'a latched settings flag costs one reconfigure and is not cleared behind the dialog');
 
     check(() => {
-        // The latch is gone and no reload is pending, so the next press is not
-        // deferred again: it toggles synchronously without any D-Bus traffic.
+        // Focus finally leaves the dialog and the reload it triggers lands with a
+        // normal window focused, which is what clears the latch.
+        activate(context, window1);
+        assert.equal(context.settingsWindowSeen, false, 'the focus change clears the latch');
+        assert.equal(reconfigureCalls().length, 2);
+        emitConfigChanged(context);
+        assert.equal(context.settingsWindowSeen, false,
+            'a reload with a normal window focused keeps the latch cleared');
+
         harness.shortcuts[0].callback();
         assert.equal(window1.minimized, false, 'the press toggles immediately');
-        assert.equal(reconfigureCalls().length, 1, 'no reload is requested any more');
+        assert.equal(reconfigureCalls().length, 2, 'no reload is requested any more');
         assert.deepEqual(pendingIndexes(context), [], 'nothing is pending');
     }, 'after the healing reload a press is not deferred again');
 }
@@ -1038,6 +1162,136 @@ function pendingIndexes(context) {
             assert.ok(widgetNames.includes('WindowName' + slot), 'kcfg_WindowName' + slot + ' exists');
         }
     }, 'contents/ui/config.ui mirrors main.xml and SLOT_COUNT one to one');
+}
+
+// ============================== 14. translation coverage of the settings form
+//
+// The compiled catalog is the only thing that translates contents/ui/config.ui,
+// so a string that lupdate did not extract silently stays English. The .pot is
+// therefore compared with the form itself, which catches a string that was added
+// without re-running tools/update-po.sh.
+const PO_ESCAPES = { n: '\n', t: '\t', r: '\r', '"': '"', '\\': '\\' };
+
+function poUnquote(quoted) {
+    assert.ok(quoted.length >= 2 && quoted.startsWith('"') && quoted.endsWith('"'),
+        'a PO string is double quoted: ' + quoted);
+    return quoted.slice(1, -1).replace(/\\(.)/g, (all, char) =>
+        (Object.prototype.hasOwnProperty.call(PO_ESCAPES, char) ? PO_ESCAPES[char] : char));
+}
+
+// Minimal .pot reader: multi-line entries are concatenated as gettext does, PO
+// escapes are decoded, and obsolete "#~" entries are counted separately.
+function parsePot(source) {
+    const msgids = [];
+    let obsolete = 0;
+    let current = null;
+
+    const flush = () => {
+        // The empty msgid is the catalog header, not a translatable string.
+        if (current !== null && current !== '') {
+            msgids.push(current);
+        }
+        current = null;
+    };
+
+    for (const rawLine of source.split('\n')) {
+        const line = rawLine.trim();
+        if (line.startsWith('#~')) {
+            obsolete += 1;
+            continue;
+        }
+        if (line === '') {
+            flush();
+            continue;
+        }
+        if (line.startsWith('#')) {
+            continue;
+        }
+        if (line.startsWith('msgid ')) {
+            flush();
+            current = poUnquote(line.slice('msgid '.length));
+            continue;
+        }
+        if (line.startsWith('msgstr') || line.startsWith('msgctxt ')) {
+            // Continuation lines of a msgstr arrive with current === null and are
+            // ignored, so only msgids are collected.
+            flush();
+            continue;
+        }
+        if (line.startsWith('"')) {
+            if (current !== null) {
+                current += poUnquote(line);
+            }
+            continue;
+        }
+        assert.fail('unexpected line in po/quakewindows.pot: ' + line);
+    }
+    flush();
+
+    return { msgids, obsolete };
+}
+
+function xmlUnescape(value) {
+    return value
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&amp;/g, '&');
+}
+
+function normaliseWhitespace(value) {
+    return value.replace(/\s+/g, ' ').trim();
+}
+
+{
+    const pot = parsePot(fs.readFileSync(POT_PATH, 'utf8'));
+    const msgids = new Set(pot.msgids);
+    const normalised = new Set(pot.msgids.map(normaliseWhitespace));
+
+    check(() => {
+        assert.ok(pot.msgids.length > 0, 'the template carries msgids');
+        assert.equal(pot.obsolete, 0,
+            'po/quakewindows.pot carries ' + pot.obsolete + ' obsolete #~ line(s)');
+    }, 'po/quakewindows.pot parses and holds no obsolete entries');
+
+    check(() => {
+        const uiSource = fs.readFileSync(CONFIG_UI_PATH, 'utf8');
+        const translatable = [];
+        for (const match of uiSource.matchAll(/<string([^>]*)>([\s\S]*?)<\/string>/g)) {
+            if (/notr\s*=\s*"true"/.test(match[1])) {
+                continue;
+            }
+            translatable.push(xmlUnescape(match[2]));
+        }
+        assert.ok(translatable.length > 0, 'the form has translatable strings');
+        const missing = translatable.filter((value) =>
+            !msgids.has(value) && !normalised.has(normaliseWhitespace(value)));
+        assert.deepEqual(missing, [],
+            'translatable strings missing from po/quakewindows.pot: ' + JSON.stringify(missing));
+    }, 'every <string> of contents/ui/config.ui without notr="true" is in the .pot');
+
+    // The plugin metadata is not part of the catalog: lupdate reads the .ui file
+    // only, and KPluginMetaData picks the localized variant up from its own
+    // "Key[lang]" pairs. Both variants therefore have to be complete.
+    check(() => {
+        const plugin = JSON.parse(fs.readFileSync(METADATA_PATH, 'utf8')).KPlugin || {};
+        for (const key of ['Name', 'Description']) {
+            assert.equal(typeof plugin[key], 'string', key + ' is declared');
+            assert.ok(plugin[key].trim().length > 0, key + ' is not empty');
+            const localized = plugin[key + '[ru]'];
+            assert.equal(typeof localized, 'string', key + '[ru] is declared');
+            assert.ok(localized.trim().length > 0, key + '[ru] is not empty');
+            assert.notEqual(localized, plugin[key], key + '[ru] differs from ' + key);
+        }
+        for (const key of Object.keys(plugin)) {
+            const base = /^(.*)\[[^\]]+\]$/.exec(key);
+            if (base) {
+                assert.ok(Object.prototype.hasOwnProperty.call(plugin, base[1]),
+                    'localized key ' + key + ' has the base key ' + base[1]);
+            }
+        }
+    }, 'metadata.json carries Name and Description with non-empty [ru] variants');
 }
 
 console.log('');

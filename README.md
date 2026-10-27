@@ -18,6 +18,11 @@ Or install the directory itself while developing:
 kpackagetool6 --type KWin/Script --install .
 ```
 
+`quakewindows.kwinscript` is the distributable form. A directory install copies the whole
+tree, development files included (`tests/`, `po/`, `tools/`, `pack.sh`, this README):
+kpackagetool6 does not honour an ignore file such as `.kpackageignore`, so the archive
+built by `./pack.sh` is the only way to keep them out of an installation.
+
 Then enable **Quake Windows** in *System Settings → Window Management → KWin Scripts*.
 
 ## Configuration
@@ -53,10 +58,12 @@ the new values are applied once System Settings itself loses focus, or on the ne
 press. There is no need to disable and re-enable the script.
 
 If a hotkey is pressed before that happens, the press is held back and carried out once the
-new values have arrived; that single press may be delayed by about 200 ms and at most by the
-1 s safety timeout, because it waits for KWin to re-read `kwinrc`. If KWin does not confirm
-the reload within a second, the pending press is carried out anyway after re-reading the
-configuration one last time — a keypress is never lost.
+new values have arrived; that press may be delayed by about 200 ms and at most by the 1 s
+safety timeout, because it waits for KWin to re-read `kwinrc`. The safety timer is restarted
+by every deferred press, so the wait is up to about a second after the *last* press, not
+after the first one. If KWin does not confirm the reload within that time, the pending
+presses are carried out anyway after re-reading the configuration one last time — a
+keypress is never lost.
 
 While the Configure dialog stays focused, every press is remembered and asks for a reload.
 `requestConfigReload()` ignores a request while one is still pending, so presses spaced
@@ -116,7 +123,10 @@ tools/build-locale.sh                  # compile po/*.po into contents/locale/<l
 
 `node tests/main-js-test.mjs` runs the logic tests of `contents/code/main.js` against mocked
 KWin globals (plain Node, no dependencies). It also cross-checks `contents/config/main.xml`,
-`contents/ui/config.ui` and `SLOT_COUNT` against each other.
+`contents/ui/config.ui` and `SLOT_COUNT` against each other. It also verifies that every
+translatable string of the form is present in `po/quakewindows.pot`, that the template holds
+no obsolete entries, and that `metadata.json` carries `Name` and `Description` together with
+their `[ru]` variants.
 
 `python3 tests/ui-test.py` checks the settings form itself with PyQt6 (`QT_QPA_PLATFORM` is
 forced to `offscreen`); it is optional and skips with an explanation when PyQt6 is missing.

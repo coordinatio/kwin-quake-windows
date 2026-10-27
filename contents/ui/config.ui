@@ -55,7 +55,7 @@
          <bool>true</bool>
         </property>
         <property name="placeholderText">
-         <string notr="true">e.g. ^Alacritty$</string>
+         <string notr="true">^Alacritty$</string>
         </property>
         <property name="toolTip">
          <string>JavaScript regular expression matched against the window title. Leave empty to disable this slot.</string>
@@ -84,7 +84,7 @@
          <bool>true</bool>
         </property>
         <property name="placeholderText">
-         <string notr="true">e.g. ^Alacritty$</string>
+         <string notr="true">^Alacritty$</string>
         </property>
         <property name="toolTip">
          <string>JavaScript regular expression matched against the window title. Leave empty to disable this slot.</string>
@@ -113,7 +113,7 @@
          <bool>true</bool>
         </property>
         <property name="placeholderText">
-         <string notr="true">e.g. ^Alacritty$</string>
+         <string notr="true">^Alacritty$</string>
         </property>
         <property name="toolTip">
          <string>JavaScript regular expression matched against the window title. Leave empty to disable this slot.</string>
@@ -142,7 +142,7 @@
          <bool>true</bool>
         </property>
         <property name="placeholderText">
-         <string notr="true">e.g. ^Alacritty$</string>
+         <string notr="true">^Alacritty$</string>
         </property>
         <property name="toolTip">
          <string>JavaScript regular expression matched against the window title. Leave empty to disable this slot.</string>
@@ -171,7 +171,7 @@
          <bool>true</bool>
         </property>
         <property name="placeholderText">
-         <string notr="true">e.g. ^Alacritty$</string>
+         <string notr="true">^Alacritty$</string>
         </property>
         <property name="toolTip">
          <string>JavaScript regular expression matched against the window title. Leave empty to disable this slot.</string>
@@ -200,7 +200,7 @@
          <bool>true</bool>
         </property>
         <property name="placeholderText">
-         <string notr="true">e.g. ^Alacritty$</string>
+         <string notr="true">^Alacritty$</string>
         </property>
         <property name="toolTip">
          <string>JavaScript regular expression matched against the window title. Leave empty to disable this slot.</string>
@@ -229,7 +229,7 @@
          <bool>true</bool>
         </property>
         <property name="placeholderText">
-         <string notr="true">e.g. ^Alacritty$</string>
+         <string notr="true">^Alacritty$</string>
         </property>
         <property name="toolTip">
          <string>JavaScript regular expression matched against the window title. Leave empty to disable this slot.</string>

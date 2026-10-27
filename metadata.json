@@ -11,7 +11,7 @@
         "Description[ru]": "Заставьте любое окно вести себя как терминал в стиле Quake!",
         "Icon": "preferences-system-windows-move",
         "Id": "quakewindows",
-        "License": "GPL",
+        "License": "GPL-3.0-or-later",
         "Name": "Quake Windows",
         "Name[ru]": "Quake-окна",
         "Version": "2.2",

@@ -53,7 +53,8 @@ var unmatchedSlotLogged = [];
 
 var configSignature = null;
 
-// A settings window was activated since the last completed reload.
+// A settings window was activated since the last completed reload. Rebuilt from
+// the active window on every reload, so it cannot latch.
 var settingsWindowSeen = false;
 
 // A reconfigure was requested and options.configChanged has not arrived yet.
@@ -175,22 +176,29 @@ function applyConfig() {
     if (signature === configSignature) {
         return;
     }
-    configSignature = signature;
-    // New generation: report every unusable slot once again.
-    inactiveSlotLogged = [];
-    unmatchedSlotLogged = [];
 
+    var compiled = [];
     var active = [];
     var sources = [];
     for (var index = 0; index < SLOT_COUNT; ++index) {
-        slotRegex[index] = raw[index].enabled ? compilePattern(raw[index].pattern, index) : null;
-        if (slotRegex[index]) {
+        compiled[index] = raw[index].enabled ? compilePattern(raw[index].pattern, index) : null;
+        if (compiled[index]) {
             active.push(index);
-            sources.push((index + 1) + ": " + slotRegex[index].source);
+            sources.push((index + 1) + ": " + compiled[index].source);
         }
     }
+    var summary = "active slots: " + (sources.length ? sources.join(", ") : "none");
+
+    // Everything is committed only after the loop finished, so a throw above
+    // cannot leave a half-built generation marked as applied. The two "logged
+    // once" memories belong to the same commit: a new generation reports every
+    // unusable slot once again.
+    slotRegex = compiled;
     activeSlots = active;
-    info("active slots: " + (sources.length ? sources.join(", ") : "none"));
+    inactiveSlotLogged = [];
+    unmatchedSlotLogged = [];
+    configSignature = signature;
+    info(summary);
 }
 
 function windowClass(client) {
@@ -246,9 +254,9 @@ function currentActiveWindow() {
  * True when readConfig() may still return the values from before the settings
  * dialog was used, so a press has to wait for options.configChanged instead of
  * toggling a window from a stale configuration. Three independent reasons: a
- * reload was requested and not confirmed yet, the dialog was used since the last
- * reload, or the dialog is focused right now (it stays focused across a reload,
- * so a second Apply has to be noticed too).
+ * reload was requested and not confirmed yet, the dialog was activated since the
+ * last reload, or the dialog is focused right now (it stays focused across a
+ * reload, so a second Apply has to be noticed too).
  */
 function configMayBeStale() {
     if (awaitingConfig || settingsWindowSeen) {
@@ -424,11 +432,13 @@ function onConfigChanged() {
         warn("failed to apply configuration: " + error);
     }
     awaitingConfig = false;
-    // After a reload "the dialog was used since the last reload" is by
-    // definition false. Without this the flag latches forever when the dialog is
-    // closed without any window becoming active: every later press would pay a
-    // full reconfigure.
-    settingsWindowSeen = false;
+    // After a reload "the dialog was used since the last reload" is rebuilt from
+    // the active window instead of being cleared unconditionally: with a settings
+    // window still focused the flag only means "the dialog is still up, so another
+    // Apply may still come". With a normal window focused it becomes false, which
+    // keeps the flag self-healing when the dialog was closed without any window
+    // becoming active afterwards.
+    settingsWindowSeen = isSettingsWindow(currentActiveWindow());
     stopConfigWatchdog();
     if (pendingToggleTimer) {
         try {
