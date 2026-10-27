@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """UI checks for the Quake Windows settings form.
 
 Two independent parts:

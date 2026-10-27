@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // Logic tests for contents/code/main.js, run against mocked KWin globals.
 //
 //   node tests/main-js-test.mjs
@@ -832,13 +831,14 @@ function assertGenerationIntact(context, before) {
             'replaying a press must not request another reload');
         assert.equal(context.awaitingConfig, false);
         assert.equal(context.replaying, false, 'the replay flag is cleared by finally');
-        assert.equal(context.settingsWindowSeen, true,
-            'the reload keeps the latch: the dialog is still focused, another Apply may come');
+        assert.equal(context.settingsWindowSeen, false,
+            'the replay activated a normal window, so focus left the dialog and the latch is cleared');
     }, 'a replayed press does not request a second configuration reload');
 
     check(() => {
         // The dialog is focused again and the user pressed OK a second time. The
-        // latch survived the first reload, so it catches this press on its own.
+        // activation re-armed the latch, so this press is deferred on its own and
+        // asks for the reload the second Apply needs.
         activate(context, settingsWindow());
         harness.shortcuts[0].callback();
         assert.equal(window1.minimized, false, 'the press is deferred again');
@@ -982,22 +982,22 @@ function assertGenerationIntact(context, before) {
 
         // The Wayland restore path may deliver windowActivated only after the
         // replay returned, i.e. with `replaying` already false. The flag only
-        // suppresses the synchronous variant; an asynchronous one can cost one
-        // extra reconfigure, which is harmless and pinned here.
+        // suppresses the synchronous variant; the latch the synchronous one
+        // cleared is what keeps the late delivery from costing a reconfigure.
         configTimer(context).fire();
         assert.deepEqual(pendingIndexes(context), [], 'no press is lost');
         assert.equal(window1.minimized, false, 'the press toggled the window exactly once');
         assert.equal(reconfigureCalls().length, 1,
             'the synchronous activation caused by the replay is suppressed');
+        assert.equal(context.settingsWindowSeen, false,
+            'the replayed restore of a normal window cleared the latch');
 
         activate(context, window1);   // the same activation, delivered late
         assert.deepEqual(pendingIndexes(context), [], 'still no press is lost');
         assert.equal(window1.minimized, false, 'and nothing is toggled twice');
-        assert.equal(reconfigureCalls().length, 2,
-            'the asynchronous activation costs at most one extra reconfigure');
-        activate(context, window1);   // the latch is cleared now
-        assert.equal(reconfigureCalls().length, 2, 'the extra reconfigure happens once');
-    }, 'a windowActivated delivered after the replay loses no press and costs at most one reload');
+        assert.equal(reconfigureCalls().length, 1,
+            'the late activation of the same window costs no reconfigure');
+    }, 'a windowActivated delivered after the replay loses no press and costs no reload');
 }
 
 // ======================= 5g. a replay that focuses a settings window re-arms the latch
@@ -1034,6 +1034,41 @@ function assertGenerationIntact(context, before) {
         assert.equal(reconfigureCalls().length, 2,
             'the re-armed latch picks up the next focus loss');
     }, 'a settings window activated during a replay re-arms the latch without a reload');
+}
+
+// ============= 5h. a replay that focuses a normal window clears the settings latch
+//
+// The latch only means "the dialog was used since the last reload". When a replay
+// restores a hidden window, KWin activates that normal window, so the dialog is
+// demonstrably not the focused one any more and the latch can be dropped. Only
+// the reload request of that focus loss stays suppressed: one was just answered.
+{
+    const window1 = makeWindow('first title');
+    window1.minimized = true;      // replaying the press restores and activates it
+    const { context } = load({ WindowName1: '^first title$', windows: [window1] });
+
+    check(() => {
+        activate(context, settingsWindow());
+        assert.equal(context.settingsWindowSeen, true);
+        harness.shortcuts[0].callback();
+        assert.deepEqual(pendingIndexes(context), [0], 'the press is deferred');
+        assert.equal(reconfigureCalls().length, 1);
+
+        // The dialog is still the active window when the answer arrives, so the
+        // reload itself keeps the latch; the replay then restores the hidden
+        // window, which activates it while `replaying` is set.
+        emitConfigChanged(context);
+        assert.equal(window1.minimized, false, 'the replayed press restored the window');
+        assert.equal(context.settingsWindowSeen, false,
+            'the normal window activated by the replay cleared the latch');
+        assert.equal(reconfigureCalls().length, 1, 'and requested no reload');
+
+        // The next press is not deferred a second time.
+        harness.shortcuts[0].callback();
+        assert.equal(window1.minimized, true, 'the next press toggles immediately');
+        assert.deepEqual(pendingIndexes(context), [], 'nothing stays pending');
+        assert.equal(reconfigureCalls().length, 1, 'and requests no reload either');
+    }, 'a replay that activates a normal window clears the settings latch without a reload');
 }
 
 // ===================================== 6. the configuration deadline (finding 4)
@@ -1389,11 +1424,37 @@ function assertGenerationIntact(context, before) {
             'a failing flag write does not escape into KWin');
         assert.match(harness.warnings.join('\n'),
             /could not set the toggle flags of a window matching slot 1/);
-        assert.equal(other.minimized, false, 'the dying window was not replaced by another one');
+        assert.equal(other.minimized, false, 'a window that does not match the slot is untouched');
 
         harness.shortcuts[1].callback();
         assert.equal(other.minimized, true, 'the next press still works');
     }, 'a window whose minimized setter throws does not escape into KWin');
+
+    check(() => {
+        // Two windows match the slot: the first one is going away, so its flag
+        // write throws. The press must not be swallowed - the second matching
+        // window is toggled instead, and still only one window is toggled.
+        const dying = makeWindow('quake');
+        Object.defineProperty(dying, 'minimized', {
+            get() {
+                return false;
+            },
+            set: goingAway,
+        });
+        const healthy = makeWindow('quake');
+        const { context } = load({ WindowName1: '^quake$', windows: [dying, healthy] });
+
+        assert.doesNotThrow(() => harness.shortcuts[0].callback(),
+            'the failing write does not escape into KWin');
+        assert.match(harness.warnings.join('\n'),
+            /could not set the toggle flags of a window matching slot 1/);
+        assert.equal(healthy.minimized, true,
+            'the second matching window is toggled instead');
+        assert.equal(healthy.onAllDesktops, true, 'with all of its toggle flags');
+        assert.equal(dying.minimized, false, 'the dying window is left alone');
+        assert.equal(context.unmatchedSlotLogged[0], undefined,
+            'the slot is not reported as matching nothing');
+    }, 'a window whose flag write fails does not swallow the press when another window matches');
 
     check(() => {
         // Restoring a hidden window asks KWin to focus it. The focus request can

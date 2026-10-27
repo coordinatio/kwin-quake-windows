@@ -168,9 +168,11 @@ function setToggleFlags(client, hidden) {
 }
 
 /**
- * Asks KWin to focus a client. The assignment throws for a wrapper whose window
- * is being destroyed, just like a property write, so it is guarded the same way:
- * the flags of that window stay applied and only the focus request is skipped.
+ * Asks KWin to focus a client. Returns true when the request did not throw, which
+ * is all it can mean: the assignment goes through KWin's activation policy, and
+ * the policy can refuse it (for a hidden window, for example) without raising an
+ * error. A wrapper whose window is being destroyed does throw, so the assignment
+ * is guarded like a property write: the applied flags of that window stay.
  */
 function clientActivate(client) {
     if (!client) {
@@ -323,19 +325,11 @@ function normalizeWindowName(value) {
     return name;
 }
 
-/**
- * Every name KWin can identify a window by. All of them are considered instead of
- * the first non-empty one, because the sources disagree: a KCM inside System
- * Settings can carry a generic resource class while its desktop file name still
- * names the settings host. Missing properties are simply empty strings.
- */
-function windowNames(client) {
-    return [
-        normalizeWindowName(clientText(client, "resourceClass")),
-        normalizeWindowName(clientText(client, "resourceName")),
-        normalizeWindowName(clientText(client, "desktopFileName"))
-    ];
-}
+// The client properties that can name the settings host, in the order they are
+// read. All of them are considered instead of the first non-empty one, because
+// the sources disagree: a KCM inside System Settings can carry a generic resource
+// class while its desktop file name still names the settings host.
+var settingsNameProperties = ["resourceClass", "resourceName", "desktopFileName"];
 
 /**
  * Matches one module name against the settings hosts: systemsettings,
@@ -362,8 +356,9 @@ function isSettingsName(name) {
 }
 
 /**
- * True when any name of the window identifies it as a host of the settings
- * dialog.
+ * True when one of the window's names identifies it as a host of the settings
+ * dialog. The scan stops at the first property that does, so the common case
+ * reads one property instead of three.
  *
  * Known trade-off, kept on purpose: a third-party window whose name merely ends
  * with "settings" also counts as a settings window. Missing the real dialog costs
@@ -371,9 +366,9 @@ function isSettingsName(name) {
  * reconfigure.
  */
 function isSettingsWindow(client) {
-    var names = windowNames(client);
-    for (var index = 0; index < names.length; ++index) {
-        if (isSettingsName(names[index])) {
+    for (var index = 0; index < settingsNameProperties.length; ++index) {
+        var name = normalizeWindowName(clientText(client, settingsNameProperties[index]));
+        if (isSettingsName(name)) {
             return true;
         }
     }
@@ -381,12 +376,9 @@ function isSettingsWindow(client) {
 }
 
 /**
- * workspace.activeWindow itself does not throw; what throws is a property read on
- * the wrapper of a window that is being destroyed, and those reads are guarded
- * one by one (clientRead() and its callers). This try/catch only covers the
- * property access on the workspace object itself, where an unexpected error
- * would otherwise escape into KWin; it is the last line of defence, not the
- * guard that protects a dying window.
+ * The active window, or null when reading it throws. Only the property access on
+ * the workspace object is guarded here; reads on the client itself go through
+ * clientRead().
  */
 function currentActiveWindow() {
     try {
@@ -677,8 +669,10 @@ function onWindowActivated(client) {
     }
     if (replaying) {
         // Caused by replaying a press after a reload, which the user did not
-        // trigger: the configuration was reloaded a moment ago, so only the
-        // reload request of this focus loss is suppressed.
+        // trigger: focus demonstrably left the dialog and the configuration was
+        // reloaded a moment ago, so the latch can be cleared. Only the reload
+        // request of this focus loss is suppressed: one was just answered.
+        settingsWindowSeen = false;
         return;
     }
     if (settingsWindowSeen) {
@@ -687,16 +681,26 @@ function onWindowActivated(client) {
     }
 }
 
-function isRelevant(client, index) {
+/**
+ * True when the caption matches the expression of one slot. An empty caption
+ * never matches, so a catch-all expression does not touch caption-less windows.
+ * Taking the caption as an argument lets a caller that reads it once - the
+ * desktop-change fixup - test every active slot against the same string.
+ */
+function captionMatches(caption, index) {
     var regex = slotRegex[index];
-    if (!regex || !client) {
-        return false;
-    }
-    var caption = clientText(client, "caption");
-    if (!caption) {
+    if (!regex || !caption) {
         return false;
     }
     return regex.test(caption);
+}
+
+/** True when the caption of a client matches the expression of one slot. */
+function isRelevant(client, index) {
+    if (!client) {
+        return false;
+    }
+    return captionMatches(clientText(client, "caption"), index);
 }
 
 /**
@@ -746,16 +750,18 @@ function toggleWindow(index, configIsFresh) {
         var prevMini = clientRead(client, "minimized", false);
         if (!setToggleFlags(client, !prevMini)) {
             // A window that throws on a flag write is going away; the press must
-            // not turn into an error because of it.
+            // not turn into an error because of it. Another window may match the
+            // same slot and still be alive, so the scan goes on instead of
+            // giving up on the press.
             warn("could not set the toggle flags of a window matching slot " + (index + 1));
-            break;
+            continue;
         }
         if (prevMini && !clientActivate(client)) {
-            // The window is going away: it has been toggled, it just cannot be
-            // focused. The press itself is done.
+            // The window is going away: it has been toggled, it just could not be
+            // asked to take focus. The press itself is done.
             warn("could not activate a window matching slot " + (index + 1));
         }
-        break; // only toggle one window
+        break; // at most one window per slot is toggled
     }
     if (!matched && !unmatchedSlotLogged[index]) {
         // The expression is valid, so a typo in it is the likely cause. Again
@@ -775,8 +781,15 @@ function onCurrentDesktopChanged(previousDesktop, newDesktop) {
     var allClients = workspace.windowList();
     for (var i = 0; i < allClients.length; ++i) {
         var client = allClients[i];
+        // The caption is read once per window and then tested against every
+        // active slot: this loop walks the whole window list on every desktop
+        // switch, so a property read per slot is wasted work.
+        var caption = clientText(client, "caption");
+        if (!caption) {
+            continue;
+        }
         for (var j = 0; j < activeSlots.length; ++j) {
-            if (isRelevant(client, activeSlots[j])) {
+            if (captionMatches(caption, activeSlots[j])) {
                 // Assigning the same value twice is pointless, so the first
                 // matching slot decides for this window. A window that is going
                 // away is skipped here and the rest of the list is still fixed up.

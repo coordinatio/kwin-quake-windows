@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Catalog checks for the Quake Windows translations.
 
 Verifies that the committed compiled catalog really ships the Russian text

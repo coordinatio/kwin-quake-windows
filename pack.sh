@@ -24,8 +24,10 @@ for required in contents/config/main.xml contents/ui/config.ui contents/code/mai
 done
 
 # External commands the build calls. A missing one is reported the same way as a
-# missing input file, before anything is staged.
-for tool in zip; do
+# missing input file, before anything is staged. md5sum is part of the check even
+# though it only feeds the drift warning below: without it both checksums would be
+# empty, compare equal and silently disable that warning.
+for tool in zip md5sum; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "ERROR: $tool is not installed, refusing to build $package" >&2
         exit 1

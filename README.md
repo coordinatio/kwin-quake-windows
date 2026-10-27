@@ -120,13 +120,22 @@ Known trade-offs:
   with a possibly stale configuration is toggled synchronously instead of waiting forever.
   The same fallback applies when the reconfigure request itself fails. That is reported
   once in the journal, and a reload request is never latched without a deadline to end it.
+* Holding a hotkey while a settings window is focused defers every auto-repeated press, and
+  the parity model then decides the outcome: an odd number of presses toggles the slot once
+  after the deadline, an even number toggles nothing at all. That is inherent to counting
+  presses instead of queueing them, not a bug.
 
 ### Reading the journal
 
 Everything the script reports goes to KWin's journal: `journalctl -f -u plasma-kwin_wayland`
-shows the `QuakeWindows:` lines live, and `QT_LOGGING_RULES="kwin_scripting.debug=true"`
-(exported before KWin starts) raises the scripting category to debug level when a warning is
-not enough.
+shows the `QuakeWindows:` lines live. They are written by the script's `console` calls, which
+belong to QJSEngine's console extension, so their logging category is `js` — a journal record
+of such a line carries `QT_CATEGORY=js`. `kwin_scripting` is KWin's own scripting category
+(the `<file>:<line>: error: …` lines of an uncaught script error), not this one.
+
+`console.warn` is a warning and is shown by default, like the informational lines. To quiet
+the informational ones, export `QT_LOGGING_RULES="js.info=false"` before KWin starts;
+`js.debug=true` only affects `console.log`, which this script does not use.
 
 ### How a toggle changes window properties
 
@@ -148,8 +157,11 @@ kwriteconfig6 --file ~/.config/kwinrc --group Script-quakewindows --key Enabled1
 ```
 
 `WindowName1` … `WindowName7` hold the expressions, `Enabled1` … `Enabled7` (optional,
-default `true`) switch the slots on and off. After a manual edit either reopen the
-configuration dialog and press OK, or disable and re-enable the script.
+default `true`) switch the slots on and off. `kwriteconfig6` escapes the value for you, but a
+line typed into `kwinrc` by hand must have every backslash doubled (`\\`) because KConfig
+reads the file as an escaped string — unlike the form field, which stores the expression
+verbatim. After a manual edit either reopen the configuration dialog and press OK, or disable
+and re-enable the script.
 
 ## Migration from 2.1
 
