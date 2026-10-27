@@ -35,6 +35,8 @@ expression matched against the window title:
   `\.rocket\.chat` work as expected. Invalid patterns are ignored and reported in the KWin
   journal; the other slots keep working.
 * **Defaults** in the dialog clears every expression and enables every slot.
+* A field that contains only whitespace counts as empty, so the slot is disabled — strip
+  significant leading or trailing spaces if you really need them.
 
 ### Hotkeys
 
@@ -48,8 +50,15 @@ identifiers did not change.
 Press **Apply** or **OK**. The new values are applied as soon as the configuration window
 loses focus or closes — no need to disable and re-enable the script. If a hotkey is pressed
 before that happens, the press is held back and carried out once the new values have
-arrived; that single press may be delayed by roughly half a second, because it waits for
-KWin to re-read `kwinrc`.
+arrived; that single press may be delayed by about 200 ms and at most by the 1 s safety
+timeout, because it waits for KWin to re-read `kwinrc`. If KWin does not confirm the reload
+within a second, the queued press is carried out with the previous configuration anyway —
+a keypress is never lost.
+
+Leaving System Settings triggers one KWin reconfigure even from an unrelated page, and so
+does closing `kcmshell6`: the script cannot tell which configuration module was open. That
+is the price of the generic scripted configuration module not notifying KWin after writing
+`kwinrc` (upstream TODO).
 
 If the change does not arrive (for instance after editing `kwinrc` by hand), toggle the
 script off and on again in *KWin Scripts*.
@@ -85,6 +94,11 @@ tools/update-po.sh                     # regenerate po/quakewindows.pot from con
 msgmerge --update po/ru.po po/quakewindows.pot
 tools/build-locale.sh                  # compile po/*.po into contents/locale/<lang>/LC_MESSAGES/*.mo
 ```
+
+## Tests
+
+`node tests/main-js-test.mjs` runs the logic tests of `contents/code/main.js` against mocked
+KWin globals (plain Node, no dependencies).
 
 ## Credits
 

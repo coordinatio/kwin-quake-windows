@@ -33,8 +33,13 @@ var MAX_PENDING_TOGGLES = 8;
 // If KWin never confirms the reload, replay the queued presses after this delay.
 var SAFETY_TIMEOUT_MS = 1000;
 
-// Applications that host the settings dialog.
-var SETTINGS_APP_CLASSES = ["systemsettings", "plasma-systemsettings", "kcmshell", "kcmshell6"];
+// A reload request that stays unanswered must not block the next one forever.
+// callDBus() drops error replies, so this is the only way out.
+var CONFIG_WATCHDOG_MS = 2000;
+
+// Applications that host the settings dialog. Any other kcmshell* window is
+// recognised by the prefix check in isSettingsWindow().
+var SETTINGS_APP_CLASSES = ["systemsettings", "plasma-systemsettings", "plasma-settings", "kcmshell"];
 
 var slotRegex = [];
 var activeSlotCount = 0;
@@ -46,11 +51,17 @@ var settingsWindowSeen = false;
 // A reconfigure was requested and options.configChanged has not arrived yet.
 var awaitingConfig = false;
 
+// A queued press is being replayed right now.
+var replaying = false;
+
 // Slot indices whose hotkey was pressed while the configuration was stale.
 var pendingToggles = [];
 
 // Single-shot safety net for the queue above, created lazily.
 var pendingToggleTimer = null;
+
+// Single-shot watchdog for an unanswered reload request, created lazily.
+var configWatchdogTimer = null;
 
 var initialized = false;
 
@@ -201,12 +212,65 @@ function requestConfigReload() {
         return;
     }
     awaitingConfig = true;
+    armConfigWatchdog();
     try {
         callDBus("org.kde.KWin", "/KWin", "org.kde.KWin", "reconfigure");
     } catch (error) {
         awaitingConfig = false;
+        stopConfigWatchdog();
         warn("could not ask KWin to reload its configuration: " + error);
     }
+}
+
+function configWatchdog() {
+    if (configWatchdogTimer) {
+        return configWatchdogTimer;
+    }
+    try {
+        configWatchdogTimer = new QTimer();
+        configWatchdogTimer.singleShot = true;
+        configWatchdogTimer.interval = CONFIG_WATCHDOG_MS;
+        configWatchdogTimer.timeout.connect(onConfigWatchdogTimeout);
+    } catch (error) {
+        warn("could not create the configuration watchdog timer: " + error);
+        configWatchdogTimer = null;
+    }
+    return configWatchdogTimer;
+}
+
+function armConfigWatchdog() {
+    var timer = configWatchdog();
+    if (!timer) {
+        return;
+    }
+    try {
+        timer.start(CONFIG_WATCHDOG_MS);
+    } catch (error) {
+        warn("could not start the configuration watchdog timer: " + error);
+    }
+}
+
+function stopConfigWatchdog() {
+    if (!configWatchdogTimer) {
+        return;
+    }
+    try {
+        configWatchdogTimer.stop();
+    } catch (error) {
+        warn("could not stop the configuration watchdog timer: " + error);
+    }
+}
+
+/**
+ * options.configChanged never arrived. Clearing awaitingConfig keeps the reload
+ * request path alive instead of ignoring every later request.
+ */
+function onConfigWatchdogTimeout() {
+    if (!awaitingConfig) {
+        return;
+    }
+    awaitingConfig = false;
+    warn("KWin did not confirm the configuration reload");
 }
 
 function safetyTimer() {
@@ -227,6 +291,8 @@ function safetyTimer() {
 
 function queuePendingToggle(index) {
     if (pendingToggles.length >= MAX_PENDING_TOGGLES) {
+        // Dropping a press is better than unbounded growth, but never silent.
+        warn("the queue of pending toggles is full, dropping the oldest queued toggle");
         pendingToggles.shift();
     }
     pendingToggles.push(index);
@@ -248,12 +314,20 @@ function replayPendingToggles() {
     }
     var queued = pendingToggles;
     pendingToggles = [];
-    for (var i = 0; i < queued.length; ++i) {
-        try {
-            toggleWindow(queued[i], true);
-        } catch (error) {
-            warn("failed to replay toggle of window " + (queued[i] + 1) + ": " + error);
+    // Toggling a hidden window activates it, which fires windowActivated. The
+    // configuration was just reloaded, so such an activation must not request
+    // another reload.
+    replaying = true;
+    try {
+        for (var i = 0; i < queued.length; ++i) {
+            try {
+                toggleWindow(queued[i], true);
+            } catch (error) {
+                warn("failed to replay toggle of window " + (queued[i] + 1) + ": " + error);
+            }
         }
+    } finally {
+        replaying = false;
     }
 }
 
@@ -267,6 +341,7 @@ function onConfigChanged() {
         warn("failed to apply configuration: " + error);
     }
     awaitingConfig = false;
+    stopConfigWatchdog();
     if (pendingToggleTimer) {
         try {
             pendingToggleTimer.stop();
@@ -295,6 +370,11 @@ function onPendingToggleTimeout() {
  * way to know when to ask KWin to re-read kwinrc.
  */
 function onWindowActivated(client) {
+    if (replaying) {
+        // Caused by replaying a press after a reload, which the user did not
+        // trigger: the configuration was reloaded a moment ago.
+        return;
+    }
     if (isSettingsWindow(client)) {
         // Values are written when the dialog is applied or closed, so the reload
         // has to wait until focus leaves it.
@@ -358,7 +438,7 @@ function toggleWindow(index, configIsFresh) {
 
 function onCurrentDesktopChanged(oldDesktop, previousDesktop) {
     if (!activeSlotCount) {
-        // Nothing is matched anyway, skip the window scan.
+        // No slot has a usable expression, skip the window scan.
         return;
     }
     // That is the workaround for the bug which makes the hidden windows reappear
@@ -383,14 +463,30 @@ function makeToggleHandler(index) {
     };
 }
 
+function handleCurrentDesktopChanged(oldDesktop, newDesktop) {
+    try {
+        onCurrentDesktopChanged(oldDesktop, newDesktop);
+    } catch (error) {
+        warn("failed to handle a desktop change: " + error);
+    }
+}
+
+function handleWindowActivated(client) {
+    try {
+        onWindowActivated(client);
+    } catch (error) {
+        warn("failed to handle a window activation: " + error);
+    }
+}
+
 function connectSignals() {
     try {
-        workspace.currentDesktopChanged.connect(onCurrentDesktopChanged);
+        workspace.currentDesktopChanged.connect(handleCurrentDesktopChanged);
     } catch (error) {
         warn("could not connect currentDesktopChanged: " + error);
     }
     try {
-        workspace.windowActivated.connect(onWindowActivated);
+        workspace.windowActivated.connect(handleWindowActivated);
     } catch (error) {
         warn("could not connect windowActivated: " + error);
     }
@@ -428,6 +524,14 @@ function init() {
     }
 
     connectSignals();
+
+    // A settings window may already be open and focused when the script loads,
+    // in which case its Apply must not be missed.
+    try {
+        settingsWindowSeen = isSettingsWindow(workspace.activeWindow);
+    } catch (error) {
+        warn("could not inspect the active window: " + error);
+    }
 
     // Last statement: a re-entrant call must not register everything twice.
     initialized = true;
