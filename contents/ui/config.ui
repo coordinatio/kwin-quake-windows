@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <ui version="4.0">
  <class>KWin::QuakeWindowsConfigForm</class>
+ <!-- The top-level widget name must stay equal to <class> above: KWin's generic
+      scripted KCM calls addContextToMonitor(objectName()) on this widget, so a
+      mismatch silently drops every translation of this form. -->
  <widget class="QWidget" name="KWin::QuakeWindowsConfigForm">
   <property name="geometry">
    <rect>

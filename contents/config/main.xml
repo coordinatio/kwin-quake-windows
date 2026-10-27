@@ -5,6 +5,9 @@
       http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
   <kcfgfile name=""/>
   <group name="">
+    <!-- The seven window slots below are mirrored in contents/ui/config.ui
+         (kcfg_EnabledN / kcfg_WindowNameN widgets) and in SLOT_COUNT in
+         contents/code/main.js; keep the three in sync. -->
     <entry name="Enabled1" type="Bool">
       <default>true</default>
       <label>Window slot 1 is enabled</label>

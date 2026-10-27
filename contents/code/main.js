@@ -18,42 +18,47 @@
 
    KWin only re-reads kwinrc when it reconfigures itself, and the generic scripted
    configuration module does not notify KWin after writing the file. Therefore the
-   script notices that the settings window was used and asks KWin to reload its
-   configuration through D-Bus; KWin then emits options.configChanged and the new
-   values become visible to readConfig().
+   script watches the active window: when the settings dialog loses focus, KWin is
+   asked to reload its configuration through D-Bus; KWin then emits
+   options.configChanged and the new values become visible to readConfig(). A
+   hotkey pressed before that happens is deferred until the new values are in
+   place, because readConfig() cannot be refreshed synchronously.
 */
 
 var SLOT_COUNT = 7;
 
-// One cheap check per second: is the settings window the active window?
-var POLL_INTERVAL_MS = 1000;
+// Upper bound for the queue of hotkey presses waiting for a fresh configuration.
+var MAX_PENDING_TOGGLES = 8;
 
-// While the settings window stays active, ask KWin to re-read its configuration
-// at most every N polls.
-var POLLS_BETWEEN_RECONFIGURE = 3;
-
-// Delay before asking KWin to reconfigure, to coalesce focus changes.
-var RECONFIGURE_DELAY_MS = 400;
+// If KWin never confirms the reload, replay the queued presses after this delay.
+var SAFETY_TIMEOUT_MS = 1000;
 
 // Applications that host the settings dialog.
 var SETTINGS_APP_CLASSES = ["systemsettings", "plasma-systemsettings", "kcmshell", "kcmshell6"];
 
 var slotRegex = [];
+var activeSlotCount = 0;
 var configSignature = null;
 
+// A settings window was activated since the last reload attempt.
 var settingsWindowSeen = false;
-var pollsSinceReconfigure = 1000000;
-var reconfigurePending = false;
 
-var pollTimer = null;
-var reconfigureTimer = null;
+// A reconfigure was requested and options.configChanged has not arrived yet.
+var awaitingConfig = false;
+
+// Slot indices whose hotkey was pressed while the configuration was stale.
+var pendingToggles = [];
+
+// Single-shot safety net for the queue above, created lazily.
+var pendingToggleTimer = null;
+
 var initialized = false;
 
 function warn(message) {
     try {
         console.warn("QuakeWindows: " + message);
     } catch (error) {
-        print("QuakeWindows: " + message);
+        // Nothing sensible is left to do: console is the only output a script has.
     }
 }
 
@@ -61,8 +66,16 @@ function info(message) {
     try {
         console.info("QuakeWindows: " + message);
     } catch (error) {
-        print("QuakeWindows: " + message);
+        // Nothing sensible is left to do: console is the only output a script has.
     }
+}
+
+/**
+ * Window properties are null or undefined for windows that are going away, so
+ * every string read goes through here.
+ */
+function text(value) {
+    return typeof value === "string" ? value : "";
 }
 
 function readString(key, fallback) {
@@ -87,11 +100,11 @@ function readBool(key, fallback) {
         if (typeof value === "boolean") {
             return value;
         }
-        var text = String(value).toLowerCase();
-        if (text === "true" || text === "1") {
+        var lower = String(value).toLowerCase();
+        if (lower === "true" || lower === "1") {
             return true;
         }
-        if (text === "false" || text === "0") {
+        if (lower === "false" || lower === "0") {
             return false;
         }
         return !!value;
@@ -113,16 +126,20 @@ function readRawSlots() {
     return slots;
 }
 
+/**
+ * The pattern is compiled verbatim; only a pattern made of whitespace alone
+ * disables the slot, so expressions that intentionally end with a space keep
+ * working.
+ */
 function compilePattern(pattern, index) {
-    var source = pattern.replace(/^\s+/, "").replace(/\s+$/, "");
-    if (!source) {
+    if (!pattern || !pattern.replace(/\s/g, "")) {
         return null;
     }
     try {
-        return new RegExp(source);
+        return new RegExp(pattern);
     } catch (error) {
         warn("ignoring WindowName" + (index + 1) + ", invalid regular expression [" +
-             source + "]: " + error);
+             pattern + "]: " + error);
         return null;
     }
 }
@@ -146,34 +163,18 @@ function applyConfig() {
             active.push((index + 1) + ": " + slotRegex[index].source);
         }
     }
+    activeSlotCount = active.length;
     info("active slots: " + (active.length ? active.join(", ") : "none"));
     return true;
-}
-
-function activeWindow() {
-    try {
-        return workspace.activeWindow;
-    } catch (error) {
-        return null;
-    }
 }
 
 function windowClass(client) {
     if (!client) {
         return "";
     }
-    var name = "";
-    try {
-        name = String(client.resourceClass);
-    } catch (error) {
-        name = "";
-    }
+    var name = text(client.resourceClass);
     if (!name) {
-        try {
-            name = String(client.resourceName);
-        } catch (error) {
-            name = "";
-        }
+        name = text(client.resourceName);
     }
     return name.toLowerCase();
 }
@@ -191,30 +192,101 @@ function isSettingsWindow(client) {
     return name.indexOf("kcmshell") === 0;
 }
 
-function sendReconfigure() {
-    reconfigurePending = false;
-    pollsSinceReconfigure = 0;
+/**
+ * Asks KWin to re-read kwinrc. KWin coalesces reconfigure requests with its own
+ * 200 ms timer, so there is no point in debouncing here.
+ */
+function requestConfigReload() {
+    if (awaitingConfig) {
+        return;
+    }
+    awaitingConfig = true;
     try {
         callDBus("org.kde.KWin", "/KWin", "org.kde.KWin", "reconfigure");
     } catch (error) {
+        awaitingConfig = false;
         warn("could not ask KWin to reload its configuration: " + error);
     }
 }
 
-function requestConfigReload() {
-    if (reconfigurePending) {
+function safetyTimer() {
+    if (pendingToggleTimer) {
+        return pendingToggleTimer;
+    }
+    try {
+        pendingToggleTimer = new QTimer();
+        pendingToggleTimer.singleShot = true;
+        pendingToggleTimer.interval = SAFETY_TIMEOUT_MS;
+        pendingToggleTimer.timeout.connect(onPendingToggleTimeout);
+    } catch (error) {
+        warn("could not create the pending toggle timer: " + error);
+        pendingToggleTimer = null;
+    }
+    return pendingToggleTimer;
+}
+
+function queuePendingToggle(index) {
+    if (pendingToggles.length >= MAX_PENDING_TOGGLES) {
+        pendingToggles.shift();
+    }
+    pendingToggles.push(index);
+
+    var timer = safetyTimer();
+    if (!timer) {
         return;
     }
-    reconfigurePending = true;
     try {
-        if (reconfigureTimer) {
-            reconfigureTimer.start(RECONFIGURE_DELAY_MS);
-            return;
-        }
+        timer.start(SAFETY_TIMEOUT_MS);
     } catch (error) {
-        warn("timer failed: " + error);
+        warn("could not start the pending toggle timer: " + error);
     }
-    sendReconfigure();
+}
+
+function replayPendingToggles() {
+    if (!pendingToggles.length) {
+        return;
+    }
+    var queued = pendingToggles;
+    pendingToggles = [];
+    for (var i = 0; i < queued.length; ++i) {
+        try {
+            toggleWindow(queued[i], true);
+        } catch (error) {
+            warn("failed to replay toggle of window " + (queued[i] + 1) + ": " + error);
+        }
+    }
+}
+
+/**
+ * options.configChanged arrived, so readConfig() now returns the new values.
+ */
+function onConfigChanged() {
+    try {
+        applyConfig();
+    } catch (error) {
+        warn("failed to apply configuration: " + error);
+    }
+    awaitingConfig = false;
+    if (pendingToggleTimer) {
+        try {
+            pendingToggleTimer.stop();
+        } catch (error) {
+            warn("could not stop the pending toggle timer: " + error);
+        }
+    }
+    replayPendingToggles();
+}
+
+/**
+ * KWin did not confirm the reload in time: a hotkey press must never be lost.
+ */
+function onPendingToggleTimeout() {
+    if (!pendingToggles.length) {
+        return;
+    }
+    warn("KWin did not confirm the configuration reload, applying the queued toggle(s) anyway");
+    awaitingConfig = false;
+    replayPendingToggles();
 }
 
 /**
@@ -222,27 +294,16 @@ function requestConfigReload() {
  * does not tell scripts about a script-configuration change, so this is the only
  * way to know when to ask KWin to re-read kwinrc.
  */
-function pollSettingsWindow() {
-    pollsSinceReconfigure += 1;
-
-    if (isSettingsWindow(activeWindow())) {
-        settingsWindowSeen = true;
-        if (pollsSinceReconfigure >= POLLS_BETWEEN_RECONFIGURE) {
-            requestConfigReload();
-        }
-        return;
-    }
-
-    if (settingsWindowSeen) {
-        // Focus left the settings dialog: values may just have been applied.
-        settingsWindowSeen = false;
-        requestConfigReload();
-    }
-}
-
 function onWindowActivated(client) {
     if (isSettingsWindow(client)) {
+        // Values are written when the dialog is applied or closed, so the reload
+        // has to wait until focus leaves it.
         settingsWindowSeen = true;
+        return;
+    }
+    if (settingsWindowSeen) {
+        settingsWindowSeen = false;
+        requestConfigReload();
     }
 }
 
@@ -251,27 +312,29 @@ function isRelevant(client, index) {
     if (!regex || !client) {
         return false;
     }
-    var caption = "";
-    try {
-        caption = String(client.caption);
-    } catch (error) {
-        return false;
-    }
+    var caption = text(client.caption);
     if (!caption) {
         return false;
     }
     return regex.test(caption);
 }
 
-function toggleWindow(index) {
-    if (settingsWindowSeen) {
-        // The dialog was used: the next hotkey press should already work with
-        // the new expression.
+/**
+ * configIsFresh is true when readConfig() is known to return the current values,
+ * i.e. for a press that is replayed after options.configChanged.
+ */
+function toggleWindow(index, configIsFresh) {
+    if (!configIsFresh && (awaitingConfig || settingsWindowSeen)) {
+        // The dialog was used and readConfig() still holds the old values, so the
+        // press waits for options.configChanged instead of toggling a stale window.
+        queuePendingToggle(index);
         requestConfigReload();
+        return;
     }
 
     if (!slotRegex[index]) {
         // Disabled, empty or invalid slot: nothing to toggle.
+        info("slot " + (index + 1) + " is disabled or has no valid expression, nothing to toggle");
         return;
     }
 
@@ -293,7 +356,11 @@ function toggleWindow(index) {
     }
 }
 
-function onCurrentDesktopChanged(oldDesktop, movingClient) {
+function onCurrentDesktopChanged(oldDesktop, previousDesktop) {
+    if (!activeSlotCount) {
+        // Nothing is matched anyway, skip the window scan.
+        return;
+    }
     // That is the workaround for the bug which makes the hidden windows reappear
     // on the taskbar on desktop change.
     var allClients = workspace.windowList();
@@ -309,7 +376,7 @@ function onCurrentDesktopChanged(oldDesktop, movingClient) {
 function makeToggleHandler(index) {
     return function () {
         try {
-            toggleWindow(index);
+            toggleWindow(index, false);
         } catch (error) {
             warn("failed to toggle window " + (index + 1) + ": " + error);
         }
@@ -330,9 +397,9 @@ function connectSignals() {
     try {
         options.configChanged.connect(function () {
             try {
-                applyConfig();
+                onConfigChanged();
             } catch (error) {
-                warn("failed to apply configuration: " + error);
+                warn("failed to handle a configuration change: " + error);
             }
         });
     } catch (error) {
@@ -340,46 +407,30 @@ function connectSignals() {
     }
 }
 
-function startTimers() {
-    try {
-        reconfigureTimer = new QTimer();
-        reconfigureTimer.singleShot = true;
-        reconfigureTimer.timeout.connect(sendReconfigure);
-    } catch (error) {
-        warn("could not create the reconfigure timer: " + error);
-        reconfigureTimer = null;
-    }
-
-    try {
-        pollTimer = new QTimer();
-        pollTimer.interval = POLL_INTERVAL_MS;
-        pollTimer.timeout.connect(pollSettingsWindow);
-        pollTimer.start();
-    } catch (error) {
-        warn("could not create the configuration poll timer: " + error);
-        pollTimer = null;
-    }
-}
-
 function init() {
     if (initialized) {
         return;
     }
-    initialized = true;
 
     applyConfig();
 
     for (var index = 0; index < SLOT_COUNT; ++index) {
-        registerShortcut(
-            "QuakeWindows " + (index + 1),
-            "Toggle Window " + (index + 1),
-            "",
-            makeToggleHandler(index)
-        );
+        try {
+            registerShortcut(
+                "QuakeWindows " + (index + 1),
+                "Toggle Window " + (index + 1),
+                "",
+                makeToggleHandler(index)
+            );
+        } catch (error) {
+            warn("could not register shortcut " + (index + 1) + ": " + error);
+        }
     }
 
     connectSignals();
-    startTimers();
+
+    // Last statement: a re-entrant call must not register everything twice.
+    initialized = true;
 }
 
 try {

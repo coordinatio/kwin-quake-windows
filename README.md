@@ -45,9 +45,14 @@ identifiers did not change.
 
 ### Applying changes
 
-Press **Apply** or **OK**; the script picks up the new values within a second or two, no
-need to disable and re-enable it. If the change does not arrive (for instance after editing
-`kwinrc` by hand), toggle the script off and on again in *KWin Scripts*.
+Press **Apply** or **OK**. The new values are applied as soon as the configuration window
+loses focus or closes — no need to disable and re-enable the script. If a hotkey is pressed
+before that happens, the press is held back and carried out once the new values have
+arrived; that single press may be delayed by roughly half a second, because it waits for
+KWin to re-read `kwinrc`.
+
+If the change does not arrive (for instance after editing `kwinrc` by hand), toggle the
+script off and on again in *KWin Scripts*.
 
 ## Manual configuration (legacy)
 
