@@ -8,6 +8,10 @@
 // (QTimer maps to KWin::ScriptTimer, i.e. interval/singleShot properties,
 // start()/stop() slots and the timeout signal - there is no isActive()).
 // No dependencies, plain ESM.
+//
+// The command-line side of the same script - the real QJSEngine, the real
+// QTimer metaobject and a timer that really fires - is covered by the optional
+// tests/script-engine-test.cpp and its runner.
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -45,12 +49,16 @@ class MockTimer {
         this.singleShot = false;
         this.timeout = signal();
         this.running = false;
+        // How often start() was called: the tests use it to prove that a second
+        // deferral re-arms the same timer object instead of creating a new one.
+        this.starts = 0;
     }
     start(ms) {
         if (typeof ms === 'number') {
             this.interval = ms;
         }
         this.running = true;
+        this.starts += 1;
         // Restarting a timer must not add a second entry: the tests count the
         // timer objects that were created, not the start() calls.
         if (!harness.timers.includes(this)) {
@@ -167,8 +175,9 @@ function load(state) {
         };
     }
     if (state.failTimerCreation) {
-        // The first N QTimer constructions throw, which is the case makeTimer()
-        // turns into a null timer: the script then has to work without that timer.
+        // The first N QTimer constructions throw, which is the case makeConfigTimer()
+        // turns into a null timer: the script then has to work without the
+        // configuration deadline at all. Infinity makes every construction fail.
         const HostTimer = context.QTimer;
         let constructions = 0;
         context.QTimer = function () {
@@ -193,16 +202,11 @@ function runningTimers() {
     return [...new Set(harness.timers.filter((timer) => timer.running))];
 }
 
-// The safety net is created lazily, on the first deferred press.
-function safetyTimer(context) {
-    assert.ok(context.pendingToggleTimer instanceof MockTimer, 'the safety timer exists');
-    return context.pendingToggleTimer;
-}
-
-// The reload watchdog is created lazily, on the first reload request.
-function watchdogTimer(context) {
-    assert.ok(context.configWatchdogTimer instanceof MockTimer, 'the watchdog exists');
-    return context.configWatchdogTimer;
+// The configuration deadline is a single lazily created timer, shared by the
+// reload request and the deferred presses.
+function configTimer(context) {
+    assert.ok(context.configTimer instanceof MockTimer, 'the configuration timer exists');
+    return context.configTimer;
 }
 
 // KWin makes the new window active before it emits windowActivated, so the mock
@@ -258,10 +262,10 @@ function pendingIndexes(context) {
     check(() => {
         assert.equal(harness.timers.length, 0, 'no timer object is created at init');
         assert.equal(runningTimers().length, 0, 'no timer is running after init');
-        assert.equal(context.pendingToggleTimer, null, 'the safety timer is created lazily');
-        assert.equal(context.configWatchdogTimer, null, 'the watchdog is created lazily');
+        assert.equal(context.configTimer, null,
+            'the configuration timer is created lazily');
         assert.equal(context.initialized, true, 'initialized is set last by init()');
-    }, 'init creates no timer object at all and leaves both timers unarmed');
+    }, 'init creates no timer object at all and leaves the configuration timer unarmed');
 
     check(() => {
         assert.equal(reconfigureCalls().length, 0);
@@ -637,10 +641,12 @@ function pendingIndexes(context) {
         activate(context, makeWindow('another'));
         assert.equal(reconfigureCalls().length, 1,
             'no request is repeated while configChanged is still missing');
-        assert.equal(context.pendingToggleTimer, null,
-            'no safety timer is armed for a plain focus change');
-        assert.deepEqual(runningTimers(), [watchdogTimer(context)],
-            'only the reload watchdog is armed');
+        const timer = configTimer(context);
+        assert.equal(timer.singleShot, true, 'the deadline is single shot');
+        assert.equal(timer.interval, 1000, 'the deadline is the 1 s configuration timeout');
+        assert.equal(timer.running, true, 'the deadline of the unanswered request is armed');
+        assert.deepEqual(runningTimers(), [timer],
+            'exactly one timer object is armed for a plain focus change');
     }, 'no repeated reconfigure requests while the previous one is unanswered');
 
     check(() => {
@@ -681,17 +687,19 @@ function pendingIndexes(context) {
         assert.equal(second.minimized, false);
         assert.deepEqual(pendingIndexes(context), [0], 'the press is pending');
         assert.equal(reconfigureCalls().length, 1, 'the press requests a reload itself');
-        const timer = safetyTimer(context);
+        const timer = configTimer(context);
         assert.equal(timer.singleShot, true);
         assert.equal(timer.interval, 1000);
-        assert.equal(timer.running, true, 'the safety net is armed');
+        assert.equal(timer.running, true, 'the deadline is armed');
+        assert.equal(harness.timers.length, 1,
+            'the request and the press share one timer object');
     }, 'a hotkey pressed while the configuration is stale is deferred, not toggled');
 
     check(() => {
         config.WindowName1 = '^second window$';
         emitConfigChanged(context);
         assert.deepEqual(pendingIndexes(context), [], 'no press is pending any more');
-        assert.equal(safetyTimer(context).running, false, 'the safety net is stopped');
+        assert.equal(configTimer(context).running, false, 'the deadline is stopped');
         assert.equal(second.minimized, true, 'the replayed press used the fresh expression');
         assert.equal(window1.minimized, false, 'the old expression was not used');
     }, 'options.configChanged replays the pending press with the fresh configuration');
@@ -736,12 +744,33 @@ function pendingIndexes(context) {
         emitConfigChanged(context);
         assert.equal(target.minimized, false, 'two presses toggle nothing');
         assert.equal(context.awaitingConfig, false);
-        assert.equal(safetyTimer(context).running, false,
-            'the reload stopped the safety timer');
-        assert.equal(safetyTimer(context).fire(), false,
+        assert.equal(configTimer(context).running, false,
+            'the reload stopped the deadline');
+        assert.equal(configTimer(context).fire(), false,
             'firing a stopped timer delivers nothing');
-        assert.equal(target.minimized, false, 'a stale safety timer replays nothing');
+        assert.equal(target.minimized, false, 'a stale deadline replays nothing');
     }, 'presses arriving during a pending reload are counted per slot, not queued');
+
+    check(() => {
+        // Every deferred press re-arms the same timer instead of creating a new
+        // one, so the wait runs from the last press, not from the first.
+        const timer = configTimer(context);
+        activate(context, settingsWindow());
+        for (let i = 0; i < 3; ++i) {
+            const startsBefore = timer.starts;
+            harness.shortcuts[0].callback();
+            assert.ok(timer.starts > startsBefore,
+                'press ' + (i + 1) + ' re-arms the deadline');
+            assert.equal(context.configTimer, timer, 'the timer object is reused');
+        }
+        assert.equal(harness.timers.length, 1, 'no second timer object was created');
+        assert.deepEqual(pendingIndexes(context), [0], 'three presses leave one queued');
+        assert.equal(timer.running, true);
+        emitConfigChanged(context);
+        assert.equal(timer.running, false, 'configChanged stops the re-armed deadline');
+        activate(context, window1);
+        emitConfigChanged(context);
+    }, 'three deferred presses re-arm one timer object and the reload stops it');
 }
 
 // ======================================= 5b. a replay must not reload again (finding 1)
@@ -872,6 +901,35 @@ function pendingIndexes(context) {
     }, 'a press whose slot was disabled meanwhile is dropped with its own message');
 }
 
+// ===== 5d2. a dropped replay does not silence the next live press (finding C3)
+{
+    const window1 = makeWindow('quake');
+    const other = makeWindow('other');
+    const { context, config } = load({ WindowName1: '^quake$', windows: [window1] });
+
+    check(() => {
+        activate(context, settingsWindow());
+        harness.shortcuts[0].callback();
+        assert.deepEqual(pendingIndexes(context), [0], 'the press is deferred');
+
+        // The slot is disabled while the press waits, and focus moves on without
+        // an activation event, so the latch is cleared by the reload itself.
+        setActive(context, other);
+        config.Enabled1 = false;
+        emitConfigChanged(context);
+        assert.match(harness.infos.join('\n'),
+            /the press on slot 1 was dropped because the slot is now disabled/);
+
+        // The dropped replay must not consume the once-per-generation message:
+        // a live press on the very same slot still reports its own reason.
+        const before = harness.infos.length;
+        harness.shortcuts[0].callback();
+        assert.match(harness.infos.slice(before).join('\n'),
+            /slot 1 is disabled or has no valid expression, nothing to toggle/);
+        assert.equal(window1.minimized, false, 'nothing was toggled');
+    }, 'a dropped replay does not consume the once-per-generation message of a live press');
+}
+
 // =========== 5e. a windowActivated delivered after the replay (finding 7)
 {
     const window1 = makeWindow('first title');
@@ -888,7 +946,7 @@ function pendingIndexes(context) {
         // replay returned, i.e. with `replaying` already false. The flag only
         // suppresses the synchronous variant; an asynchronous one can cost one
         // extra reconfigure, which is harmless and pinned here.
-        safetyTimer(context).fire();
+        configTimer(context).fire();
         assert.deepEqual(pendingIndexes(context), [], 'no press is lost');
         assert.equal(window1.minimized, false, 'the press toggled the window exactly once');
         assert.equal(reconfigureCalls().length, 1,
@@ -940,7 +998,11 @@ function pendingIndexes(context) {
     }, 'a settings window activated during a replay re-arms the latch without a reload');
 }
 
-// ============================================ 6. reload watchdog (finding 4)
+// ===================================== 6. the configuration deadline (finding 4)
+//
+// One timer now answers both questions the old pair answered: a deferred press
+// always has a deadline, and an unanswered reload request cannot latch. Both
+// paths are driven through this single timer.
 {
     const window1 = makeWindow('first title');
     const { context } = load({ WindowName1: '^first title$', windows: [window1] });
@@ -949,86 +1011,99 @@ function pendingIndexes(context) {
         activate(context, settingsWindow());
         activate(context, makeWindow('other'));   // focus loss -> reconfigure
         assert.equal(context.awaitingConfig, true);
-        const timer = watchdogTimer(context);
-        assert.equal(timer.singleShot, true, 'the watchdog is single shot');
-        assert.equal(timer.interval, 2000, 'the watchdog fires after 2000 ms');
-        assert.equal(timer.running, true, 'the watchdog is armed');
-        assert.equal(context.pendingToggleTimer, null, 'the safety timer is not involved');
-    }, 'requesting a reload arms one single-shot watchdog');
+        const timer = configTimer(context);
+        assert.equal(timer.singleShot, true, 'the deadline is single shot');
+        assert.equal(timer.interval, 1000, 'the deadline fires after 1000 ms');
+        assert.equal(timer.running, true, 'the deadline of the reload request is armed');
+        assert.equal(harness.timers.length, 1, 'one timer object serves the whole path');
+    }, 'requesting a reload arms the single configuration deadline');
 
     check(() => {
         const warningsBefore = harness.warnings.length;
-        watchdogTimer(context).fire();            // KWin never answered the request
+        assert.equal(configTimer(context).fire(), true, 'the armed deadline fires');
         assert.equal(context.awaitingConfig, false, 'a stuck reload request is cleared');
         assert.equal(harness.warnings.length, warningsBefore + 1, 'exactly one warning is logged');
         assert.match(harness.warnings[harness.warnings.length - 1],
             /did not confirm the configuration reload/);
-        watchdogTimer(context).fire();            // a later timeout must stay silent
-        assert.equal(watchdogTimer(context).fire(), false,
-            'the stopped watchdog delivers nothing');
+        assert.equal(configTimer(context).fire(), false,
+            'the stopped deadline delivers nothing');
         assert.equal(harness.warnings.length, warningsBefore + 1, 'the warning is logged once');
-    }, 'the watchdog unsticks an unconfirmed reload and warns once');
+    }, 'the deadline unsticks an unconfirmed reload and warns exactly once');
 
     check(() => {
-        // A later press must not wait for the 1 s safety timeout any more.
+        // A later press must not wait for a deadline any more.
         harness.shortcuts[0].callback();
         assert.equal(window1.minimized, true, 'the press toggles immediately');
         assert.deepEqual(pendingIndexes(context), [], 'nothing is pending');
-        assert.equal(context.pendingToggleTimer, null, 'no safety timer was armed');
+        assert.equal(configTimer(context).running, false, 'the deadline is not armed again');
         assert.equal(reconfigureCalls().length, 1, 'no extra reload request');
-    }, 'after the watchdog a press is not delayed by the safety timeout');
+        assert.equal(harness.timers.length, 1, 'no second timer object was created');
+    }, 'after the deadline a press is not delayed any more');
 
     check(() => {
         activate(context, settingsWindow());
-        activate(context, makeWindow('other'));   // reconfigure #2, watchdog re-armed
+        activate(context, makeWindow('other'));   // reconfigure #2, deadline re-armed
         assert.equal(reconfigureCalls().length, 2);
-        assert.equal(watchdogTimer(context).running, true, 'the watchdog is armed again');
+        assert.equal(configTimer(context).running, true, 'the deadline is armed again');
         emitConfigChanged(context);
-        assert.equal(watchdogTimer(context).running, false, 'configChanged stops the watchdog');
+        assert.equal(configTimer(context).running, false, 'configChanged stops the deadline');
         assert.equal(context.awaitingConfig, false);
-    }, 'options.configChanged stops the armed watchdog');
+        assert.equal(harness.timers.length, 1, 'still the same single timer object');
+    }, 'options.configChanged stops the armed deadline and no second timer appears');
 }
 
-// ========== 6b. the watchdog replays when no safety timer could be created (finding 4)
+// ======== 6b. without a timer a stale press toggles synchronously instead (finding C1)
 {
     const window1 = makeWindow('first title');
-    const { context, config } = load({
+    const { context } = load({
         WindowName1: '^first title$',
         windows: [window1],
-        // The safety timer cannot be created at all, so the 2 s watchdog is the
-        // only thing left that can rescue the queued press.
-        failTimerCreation: 1,
+        // QTimer cannot be created at all, so neither the reload request nor a
+        // deferred press has a deadline. Waiting would mean waiting forever.
+        failTimerCreation: Infinity,
     });
 
     check(() => {
         activate(context, settingsWindow());
         harness.shortcuts[0].callback();
-        assert.equal(window1.minimized, false, 'the press is deferred');
-        assert.deepEqual(pendingIndexes(context), [0], 'the press is pending');
-        assert.equal(context.pendingToggleTimer, null, 'the safety timer does not exist');
-        assert.match(harness.warnings.join('\n'),
-            /could not create the pending toggle timer/);
-        assert.equal(reconfigureCalls().length, 1, 'the press asked for a reload');
-        assert.equal(watchdogTimer(context).running, true, 'the watchdog is armed instead');
-    }, 'a press is queued even when the safety timer cannot be created');
+        const warnings = harness.warnings.join('\n');
+        assert.match(warnings, /could not create the configuration timer/);
+        assert.match(warnings,
+            /no configuration timer is available, toggling with the configuration as it is/);
+        assert.equal(window1.minimized, true,
+            'the press toggles synchronously instead of being lost');
+        assert.deepEqual(pendingIndexes(context), [],
+            'the parity flip is undone, nothing stays queued');
+        assert.equal(context.configTimer, null, 'there is no timer to fire');
+        assert.equal(harness.timers.length, 0, 'no timer object exists at all');
+        assert.equal(reconfigureCalls().length, 1,
+            'the reload request was still made, so the new values may still arrive');
+    }, 'a press with no timer falls back to a synchronous toggle and warns once');
 
     check(() => {
-        const renamed = makeWindow('renamed');
-        context.workspace.windows = [window1, renamed];
-        config.WindowName1 = '^renamed$';
-
+        // A second press must neither warn again nor try to create the timer
+        // again, and it must not queue anything either.
         const warningsBefore = harness.warnings.length;
-        assert.equal(watchdogTimer(context).fire(), true, 'the armed watchdog fires');
-        assert.equal(harness.warnings.length, warningsBefore + 1,
-            'the watchdog logs exactly one warning, not a second one for the replay');
-        assert.match(harness.warnings[harness.warnings.length - 1],
-            /did not confirm the configuration reload/);
-        assert.deepEqual(pendingIndexes(context), [], 'the press is no longer pending');
-        assert.equal(context.awaitingConfig, false, 'the state machine is unstuck');
-        assert.equal(renamed.minimized, true, 'the press was replayed with the re-read expression');
-        assert.equal(window1.minimized, false, 'the old expression was not used');
-        assert.equal(watchdogTimer(context).fire(), false, 'the stopped watchdog is silent');
-    }, 'the watchdog re-reads the configuration and replays a press when no safety timer exists');
+        const callsBefore = reconfigureCalls().length;
+        harness.shortcuts[0].callback();
+        assert.equal(harness.warnings.length, warningsBefore,
+            'the missing timer is reported once, not on every press');
+        assert.equal(window1.minimized, false, 'the second press toggles back');
+        assert.deepEqual(pendingIndexes(context), [], 'again nothing is queued');
+        assert.equal(reconfigureCalls().length, callsBefore,
+            'the already pending request is reused');
+        assert.equal(context.awaitingConfig, true,
+            'awaitingConfig stays set because nothing can time it out');
+        assert.equal(context.configTimerUnavailable, true,
+            'the failed creation is remembered');
+    }, 'the no-timer fallback is logged once and keeps toggling');
+
+    check(() => {
+        // The latch that no timer can clear is still cleared by a real reload.
+        emitConfigChanged(context);
+        assert.equal(context.awaitingConfig, false);
+        assert.equal(harness.timers.length, 0, 'no timer appears out of nowhere');
+    }, 'a latched reload request without a timer is cleared by configChanged');
 }
 
 // ===================================== 7. an already active settings window (finding 5)
@@ -1039,7 +1114,7 @@ function pendingIndexes(context) {
         assert.equal(context.settingsWindowSeen, true,
             'a settings window that is active at load time is imported');
         assert.equal(reconfigureCalls().length, 0, 'loading the script does not reconfigure');
-        assert.equal(context.pendingToggleTimer, null);
+        assert.equal(context.configTimer, null);
         assert.equal(harness.timers.length, 0);
     }, 'init() notices a settings window that is already active');
 
@@ -1080,7 +1155,7 @@ function pendingIndexes(context) {
     }, 'the currentDesktopChanged wrapper catches a failing property access and warns');
 }
 
-// ======================================================== 9. safety-timeout replay
+// ================================================== 9. the deadline replays a press
 {
     const window1 = makeWindow('first title');
     const { context, config } = load({ WindowName1: '^first title$', windows: [window1] });
@@ -1092,20 +1167,20 @@ function pendingIndexes(context) {
         assert.deepEqual(pendingIndexes(context), [0]);
 
         // KWin reparsed kwinrc but the configChanged signal was lost: only now,
-        // after the timer is armed, does readConfig() start returning new values.
+        // after the deadline is armed, does readConfig() start returning new values.
         const renamed = makeWindow('renamed');
         context.workspace.windows = [window1, renamed];
         config.WindowName1 = '^renamed$';
 
         const warningsBefore = harness.warnings.length;
-        safetyTimer(context).fire();  // KWin never sends configChanged
+        configTimer(context).fire();  // KWin never sends configChanged
         assert.equal(harness.warnings.length, warningsBefore + 1, 'one warning is logged');
         assert.match(harness.warnings[harness.warnings.length - 1], /did not confirm the configuration reload/);
         assert.deepEqual(pendingIndexes(context), [], 'no press is pending any more');
         assert.equal(context.awaitingConfig, false, 'the state machine is unstuck');
         assert.equal(renamed.minimized, true, 'the replayed press used the re-read expression');
         assert.equal(window1.minimized, false, 'the old expression was not used');
-    }, 'the safety timeout re-reads the configuration and replays the pending press');
+    }, 'the configuration deadline re-reads the configuration and replays the pending press');
 
     check(() => {
         // A late configChanged must not toggle the same press twice.
@@ -1116,15 +1191,16 @@ function pendingIndexes(context) {
     }, 'a late configChanged after the timeout does not toggle twice');
 
     check(() => {
-        // Nothing pending on timeout is a no-op: no warning, no re-read. The timer
-        // has to be running for the timeout to be delivered at all.
-        safetyTimer(context).start(1000);
+        // Nothing pending on the deadline is a no-op: no warning, no re-read. The
+        // timer has to be running for the timeout to be delivered at all.
+        configTimer(context).start(1000);
         const warningsBefore = harness.warnings.length;
         const infosBefore = harness.infos.length;
-        assert.equal(safetyTimer(context).fire(), true, 'the armed timer fires');
-        assert.equal(harness.warnings.length, warningsBefore);
+        assert.equal(configTimer(context).fire(), true, 'the armed deadline fires');
+        assert.equal(harness.warnings.length, warningsBefore,
+            'nothing is left to warn about once awaitingConfig is clear');
         assert.equal(harness.infos.length, infosBefore, 'the configuration is not re-read');
-    }, 'an empty pending set on the safety timeout does nothing');
+    }, 'an empty pending set on the configuration deadline does nothing');
 }
 
 // =============================================== 10. per-slot press parity (finding 4)
@@ -1151,7 +1227,7 @@ function pendingIndexes(context) {
         assert.deepEqual(pendingIndexes(even.context), [], 'two presses cancel out');
         emitConfigChanged(even.context);
         assert.equal(pairWindow.minimized, false, 'two presses leave the window untouched');
-        assert.equal(even.context.pendingToggleTimer.running, false, 'the safety net is stopped');
+        assert.equal(even.context.configTimer.running, false, 'the deadline is stopped');
     }, 'two pending presses cancel out and toggle nothing');
 
     const tripleWindow = makeWindow('quake');
@@ -1183,11 +1259,13 @@ function pendingIndexes(context) {
     }, 'presses on different slots are independent of their order');
 }
 
-// ============================================== 11. which windows are settings windows
+// ===================================== 11. which windows are settings windows
 // The window classes the stale-configuration feature depends on, one test row
 // each: a rename upstream (or a regression in the suffix heuristic) has to show
 // up here instead of in the field. The trailing-version rows are the reason the
-// heuristic strips a version suffix before the suffix test.
+// heuristic strips a version suffix before the suffix test, and the reverse-DNS
+// kcmshell row is the reason kcmshell is matched as a contained segment rather
+// than as a prefix.
 const SETTINGS_CLASSES = [
     'systemsettings',
     'systemsettings6',
@@ -1198,6 +1276,8 @@ const SETTINGS_CLASSES = [
     'kcmshell',
     'kcmshell5',
     'kcmshell6',
+    'org.kde.kcmshell6',
+    'org.kde.kcmshell',
 ];
 
 // Look-alikes that must stay unrecognised: "settings" as a substring is not

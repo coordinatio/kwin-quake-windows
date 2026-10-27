@@ -17,35 +17,22 @@
    never breaks the other slots.
 
    KWin only re-reads kwinrc when it reconfigures itself, and the generic scripted
-   configuration module does not notify KWin after writing the file. Therefore the
-   script watches the active window: when the settings dialog loses focus, KWin is
-   asked to reload its configuration through D-Bus; KWin then emits
-   options.configChanged and the new values become visible to readConfig(). A
-   hotkey pressed before that happens is deferred until the new values are in
-   place, because readConfig() cannot be refreshed synchronously.
+   configuration module does not notify KWin after writing the file. The script
+   therefore asks KWin to reconfigure when the settings dialog loses focus and
+   defers a press that arrives before the new values are visible, because
+   readConfig() cannot be refreshed synchronously. See "How configuration
+   reloading works" in README.md for the whole sequence and the trade-offs.
 */
 
 var SLOT_COUNT = 7;
 
-// If KWin never confirms the reload, replay the pending presses after this delay.
-var SAFETY_TIMEOUT_MS = 1000;
-
-// A reload request that stays unanswered must not block the next one forever.
-// callDBus() drops error replies, so this is the only way out.
-//
-// Two timers guard the reload: the safety timer above replays a deferred press
-// when options.configChanged never arrives, and this watchdog keeps the reload
-// request path itself alive; it replays too when the safety timer could not be
-// created at all.
-//
-// Belt and braces on purpose: the two timers encode two different guarantees -
-// a press is never lost, and the reload request path can never latch while
-// nothing is pending - and both paths may replay the same queue safely, because
-// replayPendingPresses() clears the queue before it acts. Keeping them apart
-// also keeps makeTimer() returning null from silently disabling both guards at
-// once: each timeout handler is written so that a missing timer of the other
-// kind still leaves a way out.
-var CONFIG_WATCHDOG_MS = 2000;
+// The one deadline of the configuration machinery. It encodes both guarantees
+// the old pair of timers carried: every deferred press has a deadline, and a
+// reload request that KWin never answers cannot latch, because callDBus() drops
+// error replies and a timeout is the only way out. The request and every deferred
+// press re-arm it, so it fires CONFIG_TIMEOUT_MS after the last event that needed
+// it, and whichever of the two happened last is handled by the same handler.
+var CONFIG_TIMEOUT_MS = 1000;
 
 var slotRegex = [];
 
@@ -78,16 +65,21 @@ var replaying = false;
 // is bounded by SLOT_COUNT.
 var pendingPresses = [];
 
-// Single-shot safety net for the presses above, created lazily.
-var pendingToggleTimer = null;
+// Single-shot deadline shared by the reload request and the deferred presses,
+// created lazily. It dies with the script: KWin owns the QJSEngine, objects
+// created in JavaScript have JavaScript ownership, so destroying the engine
+// destroys the timer - there is no unload hook to worry about. The handler stays
+// defensive anyway (a timeout can arrive half-way through a reload, and creating
+// the timer can fail), which costs a handful of lines.
+var configTimer = null;
 
-// Single-shot watchdog for an unanswered reload request, created lazily.
-//
-// Neither timer is stopped when the script is unloaded: KWin offers no unload
-// hook, so a JS-owned QTimer can outlive the script. That is harmless because
-// every handler behind them is defensive - it re-reads the configuration, finds
-// nothing pending and returns, and any throw is caught and logged.
-var configWatchdogTimer = null;
+// The "no timer at all" fallback below is worth exactly one journal line: if
+// QTimer cannot be created, every press would otherwise repeat it.
+var noTimerFallbackLogged = false;
+
+// Creating the timer failed once already. QTimer does not start working later in
+// a session, so the attempt and its warning are not repeated.
+var configTimerUnavailable = false;
 
 var initialized = false;
 
@@ -234,28 +226,37 @@ function endsWith(value, suffix) {
 /**
  * Recognises the windows that host the settings dialog: systemsettings,
  * plasma-systemsettings, plasma-settings, kdesystemsettings and reverse-DNS ids
- * like org.kde.systemsettings, plus every kcmshell* module. The class and the
+ * like org.kde.systemsettings, plus every kcmshell module. The class and the
  * resource name end with the module name, so the suffix decides: a look-alike
  * such as "not-settings-really" or "plasma-settings-helper" is not a settings
  * window, while "org.kde.systemsettings" is.
  *
- * A trailing version number is not part of the name, so "systemsettings6" and
- * "kcmshell6" are recognised exactly like their unversioned forms.
+ * A trailing version number is not part of the name, so "systemsettings6" is
+ * recognised exactly like the unversioned form. kcmshell is matched as a
+ * contained segment rather than as a prefix, because the portal and standalone
+ * forms are reverse-DNS ids such as org.kde.kcmshell6.
+ *
+ * Known trade-off, kept on purpose: a third-party window class that merely ends
+ * with "settings" also counts as a settings window. Missing the real dialog costs
+ * a stale toggle, while a false positive only costs one deferred press and one
+ * reconfigure.
  */
 function isSettingsWindow(client) {
     var name = windowClass(client).replace(/[0-9]+$/, "");
     if (!name) {
         return false;
     }
-    if (name.indexOf("kcmshell") === 0) {
+    if (name.indexOf("kcmshell") !== -1) {
         return true;
     }
     return endsWith(name, "settings");
 }
 
 /**
- * workspace.activeWindow throws for a window that is being destroyed, and no
- * press handling may break because of it.
+ * workspace.activeWindow itself does not throw; what throws is a property read on
+ * the wrapper of a window that is being destroyed (see windowClass()). The value
+ * is fetched here and every read of it stays guarded, because no press handling
+ * may break on a dying window; the try/catch is the last line of defence only.
  */
 function currentActiveWindow() {
     try {
@@ -283,123 +284,85 @@ function configMayBeStale() {
 
 /**
  * Asks KWin to re-read kwinrc. KWin coalesces reconfigure requests with its own
- * 200 ms timer, so there is no point in debouncing here.
+ * 200 ms timer, so there is no point in debouncing here; the shared deadline is
+ * only about the answer, not about the request.
  */
 function requestConfigReload() {
     if (awaitingConfig) {
         return;
     }
     awaitingConfig = true;
-    armConfigWatchdog();
+    armConfigTimer();
     // The try/catch only guards the JS call itself: Script::callDBus() never
     // throws and silently drops error replies, so a failed reconfigure is
-    // invisible here. That is what the watchdog above is for.
+    // invisible here. The deadline armed above is what unsticks it.
     try {
         callDBus("org.kde.KWin", "/KWin", "org.kde.KWin", "reconfigure");
     } catch (error) {
         awaitingConfig = false;
-        stopConfigWatchdog();
+        stopConfigTimer();
         warn("could not ask KWin to reload its configuration: " + error);
     }
 }
 
-// Two timers, because they answer two different questions: the 1 s safety timer
-// guarantees that a deferred press is never lost even when KWin never confirms
-// the reload, while the 2 s watchdog keeps the reload request path alive and is
-// the fallback replay path when no safety timer could be created.
-
 /**
- * Creates a single-shot timer lazily. Returns null when KWin cannot create one,
- * which both callers survive by doing nothing.
+ * Creates the single-shot deadline timer lazily. Returns null when KWin cannot
+ * create one; both callers survive that (the timeout path is then simply gone,
+ * and toggleWindow() falls back to a synchronous toggle).
  */
-function makeTimer(intervalMs, description, handler) {
+function makeConfigTimer() {
     try {
         var timer = new QTimer();
         timer.singleShot = true;
-        timer.interval = intervalMs;
-        timer.timeout.connect(handler);
+        timer.interval = CONFIG_TIMEOUT_MS;
+        timer.timeout.connect(onConfigTimeout);
         return timer;
     } catch (error) {
-        warn("could not create the " + description + " timer: " + error);
+        warn("could not create the configuration timer: " + error);
         return null;
     }
 }
 
-function configWatchdog() {
-    if (!configWatchdogTimer) {
-        configWatchdogTimer = makeTimer(CONFIG_WATCHDOG_MS, "configuration watchdog",
-            onConfigWatchdogTimeout);
+function configDeadline() {
+    if (configTimer) {
+        return configTimer;
     }
-    return configWatchdogTimer;
+    if (configTimerUnavailable) {
+        return null;
+    }
+    configTimer = makeConfigTimer();
+    if (!configTimer) {
+        configTimerUnavailable = true;
+    }
+    return configTimer;
 }
 
-function armConfigWatchdog() {
-    var timer = configWatchdog();
+/**
+ * (Re)arms the single deadline. Both the reload request and every deferred press
+ * push it back, so it fires CONFIG_TIMEOUT_MS after the last of them - which is
+ * what makes a queued press wait for the last press instead of the first.
+ */
+function armConfigTimer() {
+    var timer = configDeadline();
     if (!timer) {
         return;
     }
     try {
-        timer.start(CONFIG_WATCHDOG_MS);
+        timer.start(CONFIG_TIMEOUT_MS);
     } catch (error) {
-        warn("could not start the configuration watchdog timer: " + error);
+        warn("could not start the configuration timer: " + error);
     }
 }
 
-function stopConfigWatchdog() {
-    if (!configWatchdogTimer) {
+function stopConfigTimer() {
+    if (!configTimer) {
         return;
     }
     try {
-        configWatchdogTimer.stop();
+        configTimer.stop();
     } catch (error) {
-        warn("could not stop the configuration watchdog timer: " + error);
+        warn("could not stop the configuration timer: " + error);
     }
-}
-
-/**
- * Mirror of stopConfigWatchdog() for the other timer: a timeout has been handled,
- * so the sibling timer must not fire later for a queue that is already replayed.
- */
-function stopSafetyTimer() {
-    if (!pendingToggleTimer) {
-        return;
-    }
-    try {
-        pendingToggleTimer.stop();
-    } catch (error) {
-        warn("could not stop the pending toggle timer: " + error);
-    }
-}
-
-/**
- * options.configChanged never arrived. Clearing awaitingConfig keeps the reload
- * request path alive instead of ignoring every later request.
- *
- * A queued press is rescued here as well: the 1 s safety timer is the normal way
- * out, but makeTimer() may have failed to create it at all, in which case this
- * watchdog is the only thing left that can replay. No second warning is logged
- * for that: the timeout itself is the single report of the stuck reload.
- */
-function onConfigWatchdogTimeout() {
-    if (awaitingConfig) {
-        awaitingConfig = false;
-        warn("KWin did not confirm the configuration reload");
-    }
-    if (!hasPendingPresses()) {
-        return;
-    }
-    // The queue is replayed right here, so the safety timer must not fire a
-    // second time for it after its own deadline.
-    stopSafetyTimer();
-    rereadConfigAndReplay();
-}
-
-function safetyTimer() {
-    if (!pendingToggleTimer) {
-        pendingToggleTimer = makeTimer(SAFETY_TIMEOUT_MS, "pending toggle",
-            onPendingToggleTimeout);
-    }
-    return pendingToggleTimer;
 }
 
 function notePendingPress(index) {
@@ -407,16 +370,7 @@ function notePendingPress(index) {
     // presses for this slot is odd. Dropping presses of a bounded queue could
     // leave the window in the opposite state.
     pendingPresses[index] = !pendingPresses[index];
-
-    var timer = safetyTimer();
-    if (!timer) {
-        return;
-    }
-    try {
-        timer.start(SAFETY_TIMEOUT_MS);
-    } catch (error) {
-        warn("could not start the pending toggle timer: " + error);
-    }
+    armConfigTimer();
 }
 
 function hasPendingPresses() {
@@ -452,14 +406,12 @@ function replayPendingPresses() {
             }
             if (!slotRegex[index]) {
                 // The slot was disabled or emptied while the press was deferred.
-                // Reported once per configuration generation like the other two
-                // unusable-slot messages, otherwise a stale press replayed after
-                // every Apply fills the journal.
-                if (!inactiveSlotLogged[index]) {
-                    inactiveSlotLogged[index] = true;
-                    info("the press on slot " + (index + 1) +
-                         " was dropped because the slot is now disabled");
-                }
+                // This does not consume the "logged once" memory: a replay
+                // happens at most once per generation per slot anyway, and a
+                // later live press on the same slot must still report its own
+                // message.
+                info("the press on slot " + (index + 1) +
+                     " was dropped because the slot is now disabled");
                 continue;
             }
             try {
@@ -476,11 +428,10 @@ function replayPendingPresses() {
 /**
  * options.configChanged arrived, so readConfig() now returns the new values.
  *
- * Any such signal may be treated as confirmation of our own request, whichever
- * reconfigure triggered it: Workspace::slotReconfigure() always calls
- * kwinApp()->config()->reparseConfiguration() before Options::updateSettings()
- * emits the signal, so the KWin config cache is already fresh whenever this
- * handler runs. No "is this our reload?" bookkeeping is needed.
+ * Any such signal counts as confirmation of our own request, whichever
+ * reconfigure triggered it: the KWin config cache is reparsed before the signal
+ * is emitted, so readConfig() is already fresh here and no "is this our reload?"
+ * bookkeeping is needed.
  */
 function onConfigChanged() {
     try {
@@ -496,19 +447,20 @@ function onConfigChanged() {
     // keeps the flag self-healing when the dialog was closed without any window
     // becoming active afterwards.
     settingsWindowSeen = isSettingsWindow(currentActiveWindow());
-    stopConfigWatchdog();
-    stopSafetyTimer();
+    stopConfigTimer();
     replayPendingPresses();
 }
 
 /**
- * Re-reads the configuration once more and replays whatever is queued. Shared by
- * the two timeout paths, which both mean "KWin will not confirm this reload".
+ * The configuration reload will not be confirmed any more, so the current values
+ * are the best ones available: re-read them once more and replay whatever is
+ * queued. Both halves are guarded, and applyConfig() is a no-op when the stored
+ * values did not change.
  */
 function rereadConfigAndReplay() {
     // Best effort: if KWin reparsed kwinrc but the configChanged signal was lost,
-    // this picks the fresh values up. When nothing changed, applyConfig() is a
-    // no-op thanks to the signature check.
+    // this picks the fresh values up. When nothing changed, the signature check
+    // keeps applyConfig() a no-op.
     try {
         applyConfig();
     } catch (error) {
@@ -518,17 +470,19 @@ function rereadConfigAndReplay() {
 }
 
 /**
- * KWin did not confirm the reload in time: a hotkey press must never be lost.
+ * The deadline expired without options.configChanged. Clearing awaitingConfig
+ * keeps the reload request path alive instead of ignoring every later request,
+ * and the queued presses are replayed so that no keypress is lost. The single
+ * warning is the one report of the stuck reload; nothing else logs about it.
  */
-function onPendingToggleTimeout() {
+function onConfigTimeout() {
+    if (awaitingConfig) {
+        awaitingConfig = false;
+        warn("KWin did not confirm the configuration reload, using the current values");
+    }
     if (!hasPendingPresses()) {
         return;
     }
-    warn("KWin did not confirm the configuration reload, applying the pending toggle(s) anyway");
-    awaitingConfig = false;
-    // The timeout is handled here, so the sibling watchdog must not stay armed
-    // for a reload request this path has just given up on.
-    stopConfigWatchdog();
     rereadConfigAndReplay();
 }
 
@@ -580,7 +534,18 @@ function toggleWindow(index, configIsFresh) {
         // options.configChanged instead of toggling a stale window.
         notePendingPress(index);
         requestConfigReload();
-        return;
+        if (configTimer) {
+            return;
+        }
+        // Neither the press nor the reload request got a deadline, so waiting
+        // would mean waiting forever. A toggle with a possibly stale
+        // configuration beats a press that never happens: undo the parity flip
+        // just made, say so once and fall through to the synchronous path.
+        pendingPresses[index] = !pendingPresses[index];
+        if (!noTimerFallbackLogged) {
+            noTimerFallbackLogged = true;
+            warn("no configuration timer is available, toggling with the configuration as it is");
+        }
     }
 
     if (!slotRegex[index]) {

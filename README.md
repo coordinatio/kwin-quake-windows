@@ -39,6 +39,8 @@ expression matched against the window title:
 * Patterns are JavaScript regular expressions, so `^(Chat|Messenger)$` and
   `\.rocket\.chat` work as expected. Invalid patterns are ignored and reported in the KWin
   journal; the other slots keep working.
+* Expressions are evaluated in KWin's scripting thread for every window on every press and on
+  every desktop switch, so a pathological pattern can stall window handling — keep them narrow.
 * **Defaults** in the dialog clears every expression and enables every slot.
 * A field that contains only whitespace is treated as empty, so the slot is disabled. Any
   other expression is used verbatim, so leading and trailing spaces are significant: a
@@ -56,34 +58,60 @@ identifiers did not change.
 Press **Apply** or **OK**. Closing the Configure dialog only returns focus to System Settings,
 which is itself a settings window, so the script cannot treat that as "the dialog is gone":
 the new values are applied once System Settings itself loses focus, or on the next hotkey
-press. There is no need to disable and re-enable the script.
-
-If a hotkey is pressed before that happens, the press is held back and carried out once the
-new values have arrived; that press may be delayed by about 200 ms and at most by the 1 s
-safety timeout, because it waits for KWin to re-read `kwinrc`. The safety timer is restarted
-by every deferred press, so the wait is up to about a second after the *last* press, not
-after the first one. If KWin does not confirm the reload within that time, the pending
-presses are carried out anyway after re-reading the configuration one last time — a
-keypress is never lost.
-
-A press that arrives before Apply is replayed against the configuration as it was before that
-Apply — *usually*, because this is a race, not a guarantee: it holds when the press was
-deferred before KWin's reparse finished. If Apply lands first and KWin's ~200 ms reparse
-completes before the deferred press is replayed, that press is replayed against the new
-values instead. The next press always uses the new expression.
-
-While the Configure dialog stays focused, every press is remembered and asks for a reload.
-`requestConfigReload()` ignores a request while one is still pending, so presses spaced
-further apart each cost one reconfigure, and KWin itself runs at most one configure pass per
-~200 ms.
-
-Leaving System Settings triggers one KWin reconfigure even from an unrelated page, and so
-does closing `kcmshell6`: the script cannot tell which configuration module was open. That
-is the price of the generic scripted configuration module not notifying KWin after writing
-`kwinrc` (upstream TODO).
+press. There is no need to disable and re-enable the script, and a hotkey pressed in between
+is not lost — it waits for the new values, normally about 200 ms and at most 1 s.
 
 If the change does not arrive (for instance after editing `kwinrc` by hand), toggle the
 script off and on again in *KWin Scripts*.
+
+### How configuration reloading works
+
+Why KWin has to be asked: `kwinrc` is only re-read when KWin reconfigures itself, and the
+generic scripted configuration module writes the script's group without notifying KWin
+afterwards (upstream TODO). Scripts get no signal about their own configuration either, so
+the script infers it from window focus.
+
+* **On focus loss.** Activating a settings window sets a latch; activating a non-settings
+  window with the latch set asks KWin to reconfigure through D-Bus
+  (`org.kde.KWin.reconfigure`). KWin then emits `options.configChanged`, which is the moment
+  `readConfig()` starts returning the new values. KWin coalesces reconfigure requests with
+  its own ~200 ms timer, so the script does not debounce on its own; it only ignores a new
+  request while the previous one is still unanswered, which means presses spaced further
+  apart each cost one reconfigure pass.
+* **On a press.** If the configuration may be stale — a reload was requested and not
+  confirmed, the dialog was activated since the last reload, or the dialog is focused right
+  now — the press is not carried out. Its slot is remembered as an odd/even count (toggling
+  is parity-sensitive, so two presses restore the original state and an unbounded queue is
+  unnecessary) and a reload is requested. While the dialog stays focused, presses keep being
+  remembered that way.
+* **On a timeout.** A single 1000 ms deadline is armed by the reload request and re-armed by
+  every deferred press, so it fires 1 s after the last of them rather than after the first.
+  When it fires, `awaitingConfig` is cleared (otherwise one unanswered request would ignore
+  all later ones forever, since `callDBus()` drops error replies), one line is written to the
+  journal, the configuration is re-read and the remembered presses are replayed. A press is
+  therefore never lost because KWin stayed silent.
+* **On `options.configChanged`.** Any such signal counts, whichever reconfigure caused it:
+  KWin reparses its configuration before emitting it, so the values are already fresh. The
+  script recompiles the slots, stops the deadline and replays the remembered presses in
+  slot order.
+
+Known trade-offs:
+
+* A press that arrives before Apply is replayed against the configuration as it was before
+  that Apply — *usually*, because this is a race, not a guarantee: it holds when the press
+  was deferred before KWin's reparse finished. If Apply lands first and KWin's ~200 ms
+  reparse completes before the deferred press is replayed, that press is replayed against the
+  new values instead. The next press always uses the new expression.
+* Leaving System Settings triggers one KWin reconfigure even from an unrelated page, and so
+  does closing `kcmshell6`: the script cannot tell which configuration module was open. That
+  is the price of the generic module not notifying KWin after writing `kwinrc`.
+* Which windows count as settings windows is a name heuristic (the classes ending in
+  `settings` and the `kcmshell` modules). A third-party window whose class merely ends with
+  `settings` is treated as one too, which costs at most one deferred press and one extra
+  reconfigure.
+* If the system cannot create a `QTimer` at all, there is no deadline, so a press with a
+  possibly stale configuration is toggled synchronously instead of waiting forever. That is
+  reported once in the journal.
 
 ### How a toggle changes window properties
 
@@ -158,6 +186,14 @@ with `LANG=C.UTF-8` and then with `LANG=ru_RU.UTF-8` when that locale is install
 `g++`, the Qt6/KF6 development headers, `kpackagetool6` and KWin's generic scripted configuration
 plugin; when any of them is missing it explains that and exits 0. Nothing is written outside its
 temporary directory.
+
+`./tests/run-script-engine-test.sh` is the optional check against a real script engine: it builds
+`tests/script-engine-test.cpp`, evaluates `contents/code/main.js` in a `QJSEngine` where
+`readConfig`, `registerShortcut`, `callDBus`, `console`, `workspace` and `options` are recording
+mocks and `QTimer` is the real Qt class KWin exposes, then presses the shortcuts, defers a press
+behind an active settings window, replays it through `options.configChanged` and waits for the
+actual timer to fire. It needs `g++`, `pkg-config`, `qmake6` (to locate `moc`) and the Qt6
+Core/Qml development files; when any of them is missing it explains that and exits 0.
 
 ## Credits
 
