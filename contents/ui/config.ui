@@ -1,0 +1,419 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>KWin::QuakeWindowsConfigForm</class>
+ <widget class="QWidget" name="KWin::QuakeWindowsConfigForm">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>660</width>
+    <height>640</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Quake Windows</string>
+  </property>
+  <layout class="QVBoxLayout" name="mainLayout">
+   <item>
+    <widget class="QLabel" name="introLabel">
+     <property name="text">
+      <string>Toggle any window with a global shortcut. Each slot matches one window by a regular expression on its title.</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="slotsGroupBox">
+     <property name="title">
+      <string>Window slots</string>
+     </property>
+     <layout class="QGridLayout" name="slotsLayout">
+      <property name="horizontalSpacing">
+       <number>12</number>
+      </property>
+      <item row="0" column="0">
+       <widget class="QCheckBox" name="kcfg_Enabled1">
+        <property name="text">
+         <string>Window 1</string>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
+        </property>
+        <property name="toolTip">
+         <string>Enable or disable this window slot.</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QLineEdit" name="kcfg_WindowName1">
+        <property name="clearButtonEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="placeholderText">
+         <string notr="true">e.g. ^Alacritty$</string>
+        </property>
+        <property name="toolTip">
+         <string>JavaScript regular expression matched against the window title. Leave empty to disable this slot.</string>
+        </property>
+        <property name="accessibleName">
+         <string>Window 1 title regular expression</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QCheckBox" name="kcfg_Enabled2">
+        <property name="text">
+         <string>Window 2</string>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
+        </property>
+        <property name="toolTip">
+         <string>Enable or disable this window slot.</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="QLineEdit" name="kcfg_WindowName2">
+        <property name="clearButtonEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="placeholderText">
+         <string notr="true">e.g. ^Alacritty$</string>
+        </property>
+        <property name="toolTip">
+         <string>JavaScript regular expression matched against the window title. Leave empty to disable this slot.</string>
+        </property>
+        <property name="accessibleName">
+         <string>Window 2 title regular expression</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QCheckBox" name="kcfg_Enabled3">
+        <property name="text">
+         <string>Window 3</string>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
+        </property>
+        <property name="toolTip">
+         <string>Enable or disable this window slot.</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="QLineEdit" name="kcfg_WindowName3">
+        <property name="clearButtonEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="placeholderText">
+         <string notr="true">e.g. ^Alacritty$</string>
+        </property>
+        <property name="toolTip">
+         <string>JavaScript regular expression matched against the window title. Leave empty to disable this slot.</string>
+        </property>
+        <property name="accessibleName">
+         <string>Window 3 title regular expression</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="0">
+       <widget class="QCheckBox" name="kcfg_Enabled4">
+        <property name="text">
+         <string>Window 4</string>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
+        </property>
+        <property name="toolTip">
+         <string>Enable or disable this window slot.</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="1">
+       <widget class="QLineEdit" name="kcfg_WindowName4">
+        <property name="clearButtonEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="placeholderText">
+         <string notr="true">e.g. ^Alacritty$</string>
+        </property>
+        <property name="toolTip">
+         <string>JavaScript regular expression matched against the window title. Leave empty to disable this slot.</string>
+        </property>
+        <property name="accessibleName">
+         <string>Window 4 title regular expression</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="0">
+       <widget class="QCheckBox" name="kcfg_Enabled5">
+        <property name="text">
+         <string>Window 5</string>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
+        </property>
+        <property name="toolTip">
+         <string>Enable or disable this window slot.</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="1">
+       <widget class="QLineEdit" name="kcfg_WindowName5">
+        <property name="clearButtonEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="placeholderText">
+         <string notr="true">e.g. ^Alacritty$</string>
+        </property>
+        <property name="toolTip">
+         <string>JavaScript regular expression matched against the window title. Leave empty to disable this slot.</string>
+        </property>
+        <property name="accessibleName">
+         <string>Window 5 title regular expression</string>
+        </property>
+       </widget>
+      </item>
+      <item row="5" column="0">
+       <widget class="QCheckBox" name="kcfg_Enabled6">
+        <property name="text">
+         <string>Window 6</string>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
+        </property>
+        <property name="toolTip">
+         <string>Enable or disable this window slot.</string>
+        </property>
+       </widget>
+      </item>
+      <item row="5" column="1">
+       <widget class="QLineEdit" name="kcfg_WindowName6">
+        <property name="clearButtonEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="placeholderText">
+         <string notr="true">e.g. ^Alacritty$</string>
+        </property>
+        <property name="toolTip">
+         <string>JavaScript regular expression matched against the window title. Leave empty to disable this slot.</string>
+        </property>
+        <property name="accessibleName">
+         <string>Window 6 title regular expression</string>
+        </property>
+       </widget>
+      </item>
+      <item row="6" column="0">
+       <widget class="QCheckBox" name="kcfg_Enabled7">
+        <property name="text">
+         <string>Window 7</string>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
+        </property>
+        <property name="toolTip">
+         <string>Enable or disable this window slot.</string>
+        </property>
+       </widget>
+      </item>
+      <item row="6" column="1">
+       <widget class="QLineEdit" name="kcfg_WindowName7">
+        <property name="clearButtonEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="placeholderText">
+         <string notr="true">e.g. ^Alacritty$</string>
+        </property>
+        <property name="toolTip">
+         <string>JavaScript regular expression matched against the window title. Leave empty to disable this slot.</string>
+        </property>
+        <property name="accessibleName">
+         <string>Window 7 title regular expression</string>
+        </property>
+       </widget>
+      </item>
+      <item row="7" column="0" colspan="2">
+       <widget class="QLabel" name="slotsHintLabel">
+        <property name="text">
+         <string>Leave a field empty or clear its checkbox to disable the slot. Matching is case-sensitive and searches anywhere in the title.</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="shortcutsGroupBox">
+     <property name="title">
+      <string>Global shortcuts</string>
+     </property>
+     <layout class="QVBoxLayout" name="shortcutsLayout">
+      <item>
+       <widget class="QLabel" name="shortcutsLabel">
+        <property name="text">
+         <string>Hotkeys are not configured here. Assign them in System Settings → Keyboard → Shortcuts → KWin and search for “Toggle Window 1” … “Toggle Window 7”.</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="regexGroupBox">
+     <property name="title">
+      <string>Regular expression examples</string>
+     </property>
+     <layout class="QGridLayout" name="regexExamplesLayout">
+      <property name="horizontalSpacing">
+       <number>16</number>
+      </property>
+      <item row="0" column="0">
+       <widget class="QLabel" name="regexExample1Pattern">
+        <property name="font">
+         <font>
+          <family>monospace</family>
+         </font>
+        </property>
+        <property name="text">
+         <string notr="true">^Alacritty$</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QLabel" name="regexExample1Label">
+        <property name="text">
+         <string>exact title</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="regexExample2Pattern">
+        <property name="font">
+         <font>
+          <family>monospace</family>
+         </font>
+        </property>
+        <property name="text">
+         <string notr="true">Mozilla Firefox</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="QLabel" name="regexExample2Label">
+        <property name="text">
+         <string>substring anywhere in the title</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QLabel" name="regexExample3Pattern">
+        <property name="font">
+         <font>
+          <family>monospace</family>
+         </font>
+        </property>
+        <property name="text">
+         <string notr="true">^(Chat|Messenger)$</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="QLabel" name="regexExample3Label">
+        <property name="text">
+         <string>alternatives, one of them</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="0" colspan="2">
+       <widget class="QLabel" name="regexNoteLabel">
+        <property name="text">
+         <string>Patterns use JavaScript regular expression syntax. An invalid pattern is ignored and reported in the KWin journal; the other slots keep working.</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <spacer name="verticalSpacer">
+     <property name="orientation">
+      <enum>Qt::Orientation::Vertical</enum>
+     </property>
+     <property name="sizeHint" stdset="0">
+      <size>
+       <width>20</width>
+       <height>10</height>
+      </size>
+     </property>
+    </spacer>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections>
+  <connection>
+   <sender>kcfg_Enabled1</sender>
+   <signal>toggled(bool)</signal>
+   <receiver>kcfg_WindowName1</receiver>
+   <slot>setEnabled(bool)</slot>
+  </connection>
+  <connection>
+   <sender>kcfg_Enabled2</sender>
+   <signal>toggled(bool)</signal>
+   <receiver>kcfg_WindowName2</receiver>
+   <slot>setEnabled(bool)</slot>
+  </connection>
+  <connection>
+   <sender>kcfg_Enabled3</sender>
+   <signal>toggled(bool)</signal>
+   <receiver>kcfg_WindowName3</receiver>
+   <slot>setEnabled(bool)</slot>
+  </connection>
+  <connection>
+   <sender>kcfg_Enabled4</sender>
+   <signal>toggled(bool)</signal>
+   <receiver>kcfg_WindowName4</receiver>
+   <slot>setEnabled(bool)</slot>
+  </connection>
+  <connection>
+   <sender>kcfg_Enabled5</sender>
+   <signal>toggled(bool)</signal>
+   <receiver>kcfg_WindowName5</receiver>
+   <slot>setEnabled(bool)</slot>
+  </connection>
+  <connection>
+   <sender>kcfg_Enabled6</sender>
+   <signal>toggled(bool)</signal>
+   <receiver>kcfg_WindowName6</receiver>
+   <slot>setEnabled(bool)</slot>
+  </connection>
+  <connection>
+   <sender>kcfg_Enabled7</sender>
+   <signal>toggled(bool)</signal>
+   <receiver>kcfg_WindowName7</receiver>
+   <slot>setEnabled(bool)</slot>
+  </connection>
+ </connections>
+</ui>

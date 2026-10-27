@@ -8,12 +8,17 @@
             }
         ],
         "Description": "Make any window behave like a quake-style terminal!",
+        "Description[ru]": "Заставьте любое окно вести себя как терминал в стиле Quake!",
         "Icon": "preferences-system-windows-move",
         "Id": "quakewindows",
         "License": "GPL",
         "Name": "Quake Windows",
-        "Version": "2.1",
+        "Name[ru]": "Quake-окна",
+        "Version": "2.2",
         "EnabledByDefault": true
     },
-    "X-Plasma-API": "javascript"
+    "X-Plasma-API": "javascript",
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-KDE-ConfigModule": "kwin/effects/configs/kcm_kwin4_genericscripted",
+    "X-KWin-Config-TranslationDomain": "quakewindows"
 }

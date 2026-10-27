@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+      http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
+  <kcfgfile name=""/>
+  <group name="">
+    <entry name="Enabled1" type="Bool">
+      <default>true</default>
+      <label>Window slot 1 is enabled</label>
+    </entry>
+    <entry name="WindowName1" type="String">
+      <default></default>
+      <label>Window slot 1 title regular expression</label>
+    </entry>
+    <entry name="Enabled2" type="Bool">
+      <default>true</default>
+      <label>Window slot 2 is enabled</label>
+    </entry>
+    <entry name="WindowName2" type="String">
+      <default></default>
+      <label>Window slot 2 title regular expression</label>
+    </entry>
+    <entry name="Enabled3" type="Bool">
+      <default>true</default>
+      <label>Window slot 3 is enabled</label>
+    </entry>
+    <entry name="WindowName3" type="String">
+      <default></default>
+      <label>Window slot 3 title regular expression</label>
+    </entry>
+    <entry name="Enabled4" type="Bool">
+      <default>true</default>
+      <label>Window slot 4 is enabled</label>
+    </entry>
+    <entry name="WindowName4" type="String">
+      <default></default>
+      <label>Window slot 4 title regular expression</label>
+    </entry>
+    <entry name="Enabled5" type="Bool">
+      <default>true</default>
+      <label>Window slot 5 is enabled</label>
+    </entry>
+    <entry name="WindowName5" type="String">
+      <default></default>
+      <label>Window slot 5 title regular expression</label>
+    </entry>
+    <entry name="Enabled6" type="Bool">
+      <default>true</default>
+      <label>Window slot 6 is enabled</label>
+    </entry>
+    <entry name="WindowName6" type="String">
+      <default></default>
+      <label>Window slot 6 title regular expression</label>
+    </entry>
+    <entry name="Enabled7" type="Bool">
+      <default>true</default>
+      <label>Window slot 7 is enabled</label>
+    </entry>
+    <entry name="WindowName7" type="String">
+      <default></default>
+      <label>Window slot 7 title regular expression</label>
+    </entry>
+  </group>
+</kcfg>

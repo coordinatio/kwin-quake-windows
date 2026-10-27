@@ -1,0 +1,104 @@
+# Translation template for the Quake Windows settings dialog.
+# SPDX-FileCopyrightText: 2023 Ivan Volkov <angrycore@gmail.com>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Regenerate with tools/update-po.sh after changing contents/ui/config.ui.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: quakewindows\n"
+"Report-Msgid-Bugs-To: angrycore@gmail.com\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "Quake Windows"
+msgstr ""
+
+msgid ""
+"Toggle any window with a global shortcut. Each slot matches one window by a "
+"regular expression on its title."
+msgstr ""
+
+msgid "Window slots"
+msgstr ""
+
+msgid "Window 1"
+msgstr ""
+
+msgid "Enable or disable this window slot."
+msgstr ""
+
+msgid ""
+"JavaScript regular expression matched against the window title. Leave empty "
+"to disable this slot."
+msgstr ""
+
+msgid "Window 1 title regular expression"
+msgstr ""
+
+msgid "Window 2"
+msgstr ""
+
+msgid "Window 2 title regular expression"
+msgstr ""
+
+msgid "Window 3"
+msgstr ""
+
+msgid "Window 3 title regular expression"
+msgstr ""
+
+msgid "Window 4"
+msgstr ""
+
+msgid "Window 4 title regular expression"
+msgstr ""
+
+msgid "Window 5"
+msgstr ""
+
+msgid "Window 5 title regular expression"
+msgstr ""
+
+msgid "Window 6"
+msgstr ""
+
+msgid "Window 6 title regular expression"
+msgstr ""
+
+msgid "Window 7"
+msgstr ""
+
+msgid "Window 7 title regular expression"
+msgstr ""
+
+msgid ""
+"Leave a field empty or clear its checkbox to disable the slot. Matching is "
+"case-sensitive and searches anywhere in the title."
+msgstr ""
+
+msgid "Global shortcuts"
+msgstr ""
+
+msgid ""
+"Hotkeys are not configured here. Assign them in System Settings → Keyboard → "
+"Shortcuts → KWin and search for “Toggle Window 1” … “Toggle Window 7”."
+msgstr ""
+
+msgid "Regular expression examples"
+msgstr ""
+
+msgid "exact title"
+msgstr ""
+
+msgid "substring anywhere in the title"
+msgstr ""
+
+msgid "alternatives, one of them"
+msgstr ""
+
+msgid ""
+"Patterns use JavaScript regular expression syntax. An invalid pattern is "
+"ignored and reported in the KWin journal; the other slots keep working."
+msgstr ""
