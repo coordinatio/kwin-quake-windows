@@ -1252,6 +1252,31 @@ function assertGenerationIntact(context, before) {
         assert.equal(context.configTimerArmed, false);
         assert.deepEqual(runningTimers(), [], 'configChanged arms nothing either');
     }, 'a configChanged without an armed deadline leaves everything stopped');
+
+    check(() => {
+        // One session, several presses. Each press arms the deadline twice - once
+        // in notePendingPress(), once in requestConfigReload() - so an ungated
+        // warning would repeat per arm, not per press. The timer cannot start
+        // working later in the session, so both lines are worth one report.
+        activate(context, settingsWindow());
+        const callsBefore = reconfigureCalls().length;
+        harness.shortcuts[0].callback();
+        harness.shortcuts[1].callback();
+        harness.shortcuts[0].callback();
+        const timerWarnings = harness.warnings.filter((line) =>
+            /could not start the configuration timer/.test(line));
+        const fallbackWarnings = harness.warnings.filter((line) =>
+            /could not defer the press until the configuration is reloaded/.test(line));
+        assert.equal(timerWarnings.length, 1,
+            'exactly one timer warning for the whole session (got '
+            + timerWarnings.length + ')');
+        assert.equal(fallbackWarnings.length, 1,
+            'exactly one fallback warning for the whole session (got '
+            + fallbackWarnings.length + ')');
+        assert.equal(reconfigureCalls().length - callsBefore, 4,
+            'every press still sends its own request, and the activation caused ' +
+            'by the last one adds the focus-loss request');
+    }, 'a start() that throws warns once per session across several presses');
 }
 
 // ====== 6c. a throwing callDBus must not strand the press (finding 1)
@@ -1771,6 +1796,35 @@ const SETTINGS_DESKTOP_FILES = [
             'no window scan when no slot is active');
         assert.equal(harness.warnings.length, 0);
     }, 'without an active slot the desktop-change handler returns before scanning the windows');
+
+    check(() => {
+        // The rerun of this fixup: a window whose minimized read throws may still
+        // accept a skipTaskbar write. Writing the false fallback there would
+        // clear the flag the fixup is supposed to restore, so such a window has
+        // to be skipped instead.
+        const unreadable = makeWindow('quake');
+        let writes = 0;
+        Object.defineProperty(unreadable, 'minimized', {
+            get() {
+                throw new Error('window is going away');
+            },
+        });
+        Object.defineProperty(unreadable, 'skipTaskbar', {
+            get() {
+                return unreadable._skipTaskbar;
+            },
+            set(value) {
+                writes += 1;
+                unreadable._skipTaskbar = value;
+            },
+        });
+        unreadable._skipTaskbar = true;
+        const ctx = load({ WindowName1: 'quake', Enabled1: true, windows: [unreadable] }).context;
+        assert.doesNotThrow(() => ctx.workspace.currentDesktopChanged.fns[0](null, null),
+            'the unreadable window does not escape into KWin');
+        assert.equal(writes, 0, 'no skipTaskbar write without a readable minimized');
+        assert.equal(unreadable.skipTaskbar, true, 'the existing flag is left as it was');
+    }, 'the desktop-change fixup skips a window whose minimized read throws');
 
     check(() => {
         // One window matching two slots: the fixup is idempotent, so skipTaskbar

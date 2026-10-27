@@ -87,6 +87,11 @@ var deferralFallbackLogged = false;
 // a session, so the attempt and its warning are not repeated.
 var configTimerUnavailable = false;
 
+// Starting the timer failed once already. For the same reason the failure is not
+// retried silently and its warning is one-shot: several code paths arm the same
+// deadline for one press, so an ungated warning would repeat per press.
+var configTimerStartFailedLogged = false;
+
 var initialized = false;
 
 function warn(message) {
@@ -428,7 +433,10 @@ function requestConfigReload() {
             return true;
         }
         // The latch has no deadline left to end it, so it would swallow every
-        // later request. Drop it and send a fresh one below instead.
+        // later request. Drop it and send a fresh one below instead. While the
+        // invariants above hold this branch is unreachable - awaitingConfig is
+        // only ever set together with an armed deadline - so it is a backstop
+        // that keeps a future change from leaving a latch that eats requests.
         awaitingConfig = false;
     }
     awaitingConfig = true;
@@ -506,7 +514,10 @@ function armConfigTimer() {
         configTimerArmed = true;
     } catch (error) {
         configTimerArmed = false;
-        warn("could not start the configuration timer: " + error);
+        if (!configTimerStartFailedLogged) {
+            configTimerStartFailedLogged = true;
+            warn("could not start the configuration timer: " + error);
+        }
     }
 }
 
@@ -793,7 +804,16 @@ function onCurrentDesktopChanged(previousDesktop, newDesktop) {
                 // Assigning the same value twice is pointless, so the first
                 // matching slot decides for this window. A window that is going
                 // away is skipped here and the rest of the list is still fixed up.
-                clientWrite(client, "skipTaskbar", clientRead(client, "minimized", false));
+                var minimized = clientRead(client, "minimized", null);
+                if (minimized === null) {
+                    // The read failed, so the flag this window should get is
+                    // unknown. Writing the false fallback would clear
+                    // skipTaskbar of a window the fixup could not read; another
+                    // matching slot reads the same property and gives up the
+                    // same way, so the window stays untouched.
+                    continue;
+                }
+                clientWrite(client, "skipTaskbar", minimized);
                 break;
             }
         }

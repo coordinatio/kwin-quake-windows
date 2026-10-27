@@ -109,6 +109,11 @@ Known trade-offs:
   was deferred before KWin's reparse finished. If Apply lands first and KWin's ~200 ms
   reparse completes before the deferred press is replayed, that press is replayed against the
   new values instead. The next press always uses the new expression.
+* A replay that activates a normal window clears the "dialog was used" latch, because the
+  activation looks exactly like focus leaving the dialog. So if the Configure dialog is still
+  open, the next press can use the values from before the dialog's *next* Apply instead of
+  being deferred. The Apply click refocuses the dialog and re-arms the latch, so this heals
+  itself and costs at most one press.
 * Leaving System Settings triggers one KWin reconfigure even from an unrelated page, and so
   does closing `kcmshell6`: the script cannot tell which configuration module was open. That
   is the price of the generic module not notifying KWin after writing `kwinrc`.

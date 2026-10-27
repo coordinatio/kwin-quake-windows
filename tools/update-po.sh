@@ -14,7 +14,11 @@
 # disambiguation comment that class looks it up with ki18nd(), i.e. with a plain
 # gettext lookup in the "quakewindows" domain that ignores the Qt context.
 # Therefore this catalog must not use msgctxt - lconvert writes one
-# ("KWin::QuakeWindowsConfigForm|"), so it is dropped below.
+# ("KWin::QuakeWindowsConfigForm|"), so it is dropped below. The stripping is
+# safe only while no string carries a disambiguation comment: lconvert packs the
+# Qt context and that comment into the same msgctxt, so stripping it would leave
+# two entries with one msgid and silently corrupt the lookup. The script
+# therefore fails on such a collision instead of writing a broken template.
 #
 # The header must also survive "msgfmt --check", which warns about a missing
 # PO-Revision-Date, about the gettext placeholder "YEAR-MO-DA HO:MI+ZONE" and
@@ -89,6 +93,40 @@ for line in lines[index:]:
     if line.startswith('"X-Qt-Contexts:'):
         continue
     out.append(line)
+
+
+def collect_msgids(entries):
+    """The msgid of every entry, with the continuation lines joined."""
+    ids = []
+    current = None
+    for line in entries:
+        if line.startswith('msgid '):
+            current = [line[len('msgid '):]]
+            ids.append(current)
+        elif current is not None and line.startswith('"'):
+            current.append(line)
+        else:
+            current = None
+    return [''.join(parts) for parts in ids]
+
+
+# Guard for the msgctxt stripping above. Only a string with a disambiguation
+# comment can lose its msgctxt and end up with the msgid of another entry, and
+# one of the two would then be unreachable through the context-free ki18nd()
+# lookup. No such string exists today, so this never fires for the current
+# form; it stops a future one from silently corrupting the catalog.
+msgids = collect_msgids(out)
+duplicates = sorted({msgid for msgid in msgids if msgids.count(msgid) > 1})
+if duplicates:
+    sys.stderr.write(
+        'error: stripping msgctxt would give two entries the same msgid: '
+        + ', '.join(duplicates) + '\n'
+        '       contents/ui/config.ui holds a <string comment="...">. lconvert\n'
+        '       packs the Qt context and that comment into msgctxt, and ki18n\n'
+        '       looks such a string up with ki18ndc(), so this catalog has to\n'
+        '       keep the context for it instead of dropping every msgctxt.\n'
+    )
+    sys.exit(1)
 
 text = '\n'.join(header + out).rstrip('\n') + '\n'
 text = text.replace('\n\n\n', '\n\n')
