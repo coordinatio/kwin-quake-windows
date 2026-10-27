@@ -54,6 +54,12 @@ class MockTimer {
         this.starts = 0;
     }
     start(ms) {
+        if (harness.startThrows) {
+            // A timer that exists but cannot be started: the deadline is then not
+            // armed even though there is a QTimer object, which is the case
+            // configTimerArmed has to tell apart from "no timer at all".
+            throw new Error('timer refuses to start');
+        }
         if (typeof ms === 'number') {
             this.interval = ms;
         }
@@ -104,6 +110,8 @@ const harness = {
     shortcuts: [],
     warnings: [],
     infos: [],
+    // Every MockTimer.start() throws: QTimer can be constructed but never armed.
+    startThrows: false,
 };
 
 function createContext(state) {
@@ -161,10 +169,12 @@ function reset() {
     harness.shortcuts = [];
     harness.warnings = [];
     harness.infos = [];
+    harness.startThrows = false;
 }
 
 function load(state) {
     reset();
+    harness.startThrows = Boolean(state.startThrows);
     const { context, config } = createContext(state);
     vm.createContext(context);
     if (state.throwInApplyConfig) {
@@ -1042,6 +1052,8 @@ function assertGenerationIntact(context, before) {
         assert.equal(timer.singleShot, true, 'the deadline is single shot');
         assert.equal(timer.interval, 1000, 'the deadline fires after 1000 ms');
         assert.equal(timer.running, true, 'the deadline of the reload request is armed');
+        assert.equal(context.configTimerArmed, true,
+            'the armed flag tracks the running deadline');
         assert.equal(harness.timers.length, 1, 'one timer object serves the whole path');
     }, 'requesting a reload arms the single configuration deadline');
 
@@ -1049,6 +1061,7 @@ function assertGenerationIntact(context, before) {
         const warningsBefore = harness.warnings.length;
         assert.equal(configTimer(context).fire(), true, 'the armed deadline fires');
         assert.equal(context.awaitingConfig, false, 'a stuck reload request is cleared');
+        assert.equal(context.configTimerArmed, false, 'the fired deadline is no longer armed');
         assert.equal(harness.warnings.length, warningsBefore + 1, 'exactly one warning is logged');
         assert.match(harness.warnings[harness.warnings.length - 1],
             /did not confirm the configuration reload/);
@@ -1063,6 +1076,7 @@ function assertGenerationIntact(context, before) {
         assert.equal(window1.minimized, true, 'the press toggles immediately');
         assert.deepEqual(pendingIndexes(context), [], 'nothing is pending');
         assert.equal(configTimer(context).running, false, 'the deadline is not armed again');
+        assert.equal(context.configTimerArmed, false);
         assert.equal(reconfigureCalls().length, 1, 'no extra reload request');
         assert.equal(harness.timers.length, 1, 'no second timer object was created');
     }, 'after the deadline a press is not delayed any more');
@@ -1072,8 +1086,10 @@ function assertGenerationIntact(context, before) {
         activate(context, makeWindow('other'));   // reconfigure #2, deadline re-armed
         assert.equal(reconfigureCalls().length, 2);
         assert.equal(configTimer(context).running, true, 'the deadline is armed again');
+        assert.equal(context.configTimerArmed, true);
         emitConfigChanged(context);
         assert.equal(configTimer(context).running, false, 'configChanged stops the deadline');
+        assert.equal(context.configTimerArmed, false, 'and clears the armed flag');
         assert.equal(context.awaitingConfig, false);
         assert.equal(harness.timers.length, 1, 'still the same single timer object');
     }, 'options.configChanged stops the armed deadline and no second timer appears');
@@ -1108,8 +1124,10 @@ function assertGenerationIntact(context, before) {
     }, 'a press with no timer falls back to a synchronous toggle and warns once');
 
     check(() => {
-        // A second press must neither warn again nor try to create the timer
-        // again, and it must not queue anything either.
+        // A second press must not warn again about the timer that cannot be made,
+        // and it must not queue anything either. The latch is dropped because no
+        // deadline can end it, so the press sends its own request instead of
+        // returning early on a request nothing will ever settle.
         const warningsBefore = harness.warnings.length;
         const callsBefore = reconfigureCalls().length;
         harness.shortcuts[0].callback();
@@ -1117,20 +1135,88 @@ function assertGenerationIntact(context, before) {
             'the missing timer is reported once, not on every press');
         assert.equal(window1.minimized, false, 'the second press toggles back');
         assert.deepEqual(pendingIndexes(context), [], 'again nothing is queued');
-        assert.equal(reconfigureCalls().length, callsBefore,
-            'the already pending request is reused');
-        assert.equal(context.awaitingConfig, true,
-            'awaitingConfig stays set because nothing can time it out');
+        assert.equal(reconfigureCalls().length, callsBefore + 2,
+            'the press sends its own request, and restoring the window counts as ' +
+            'a focus loss that asks once more (KWin coalesces them)');
+        assert.equal(context.awaitingConfig, false,
+            'awaitingConfig is never kept without an armed deadline');
+        assert.equal(context.configTimerArmed, false, 'nothing can be armed here');
         assert.equal(context.configTimerUnavailable, true,
             'the failed creation is remembered');
     }, 'the no-timer fallback is logged once and keeps toggling');
 
     check(() => {
-        // The latch that no timer can clear is still cleared by a real reload.
+        // configChanged is always accepted, deadline or not: it is the other way a
+        // reload settles.
         emitConfigChanged(context);
         assert.equal(context.awaitingConfig, false);
+        assert.equal(context.configTimerArmed, false);
         assert.equal(harness.timers.length, 0, 'no timer appears out of nowhere');
-    }, 'a latched reload request without a timer is cleared by configChanged');
+    }, 'configChanged settles a reload that no deadline can end');
+}
+
+// ======== 6b2. a timer that cannot be started leaves no deadline either (finding 1)
+//
+// A QTimer object may exist and still refuse start(). The deadline is then not
+// armed, so the press must be toggled synchronously and above all must not be
+// left on a queue: no clock would ever expire it. This is what configTimerArmed
+// exists for - "is there a timer object?" answers the wrong question.
+{
+    const window1 = makeWindow('first title');
+    const { context } = load({
+        WindowName1: '^first title$',
+        windows: [window1],
+        startThrows: true,
+    });
+
+    check(() => {
+        activate(context, settingsWindow());
+        assert.doesNotThrow(() => harness.shortcuts[0].callback(),
+            'the press does not escape into KWin');
+        const warnings = harness.warnings.join('\n');
+        assert.match(warnings, /could not start the configuration timer/);
+        assert.match(warnings,
+            /could not defer the press until the configuration is reloaded/);
+
+        assert.equal(window1.minimized, true,
+            'the press is toggled synchronously instead of being stranded');
+        assert.deepEqual(pendingIndexes(context), [],
+            'the parity flip is undone, nothing stays queued');
+        assert.equal(context.configTimerArmed, false,
+            'a start() that threw does not arm the deadline');
+        assert.equal(context.awaitingConfig, false,
+            'no latch is kept without an armed deadline');
+        assert.ok(context.configTimer instanceof MockTimer,
+            'a timer object does exist - creation was not the problem');
+        assert.equal(context.configTimer.running, false, 'nothing is ticking');
+        assert.deepEqual(runningTimers(), [],
+            'the clock does not run on a queue nothing will expire');
+        assert.equal(context.configTimer.fire(), false,
+            'firing it delivers no timeout');
+        assert.equal(window1.minimized, true, 'and therefore toggles nothing again');
+        assert.equal(reconfigureCalls().length, 1,
+            'the reload request was still made, so the new values may still arrive');
+    }, 'a timer whose start() throws does not strand the press');
+
+    check(() => {
+        // The next press is not blocked by a latch that could never be cleared.
+        const callsBefore = reconfigureCalls().length;
+        harness.shortcuts[0].callback();
+        assert.equal(window1.minimized, false, 'the next press toggles back');
+        assert.deepEqual(pendingIndexes(context), [], 'still nothing queued');
+        assert.equal(reconfigureCalls().length, callsBefore + 2,
+            'each press sends its own request; restoring the window adds the ' +
+            'focus-loss request (KWin coalesces them) instead of returning early');
+        assert.equal(context.configTimerArmed, false);
+        assert.equal(context.awaitingConfig, false);
+    }, 'with an unstartable timer each press sends a request and toggles');
+
+    check(() => {
+        emitConfigChanged(context);
+        assert.equal(context.awaitingConfig, false);
+        assert.equal(context.configTimerArmed, false);
+        assert.deepEqual(runningTimers(), [], 'configChanged arms nothing either');
+    }, 'a configChanged without an armed deadline leaves everything stopped');
 }
 
 // ====== 6c. a throwing callDBus must not strand the press (finding 1)
@@ -1167,6 +1253,8 @@ function assertGenerationIntact(context, before) {
         const timer = context.configTimer;
         assert.ok(timer instanceof MockTimer, 'the request did create a deadline');
         assert.equal(timer.running, false, 'the failed request disarmed it');
+        assert.equal(context.configTimerArmed, false,
+            'a deadline that was stopped is not reported as armed');
         assert.equal(timer.fire(), false, 'a stopped deadline delivers nothing');
         assert.equal(window1.minimized, true, 'the window is not toggled a second time');
     }, 'a throwing callDBus falls back to a synchronous toggle instead of stranding the press');
@@ -1306,6 +1394,55 @@ function assertGenerationIntact(context, before) {
         harness.shortcuts[1].callback();
         assert.equal(other.minimized, true, 'the next press still works');
     }, 'a window whose minimized setter throws does not escape into KWin');
+
+    check(() => {
+        // Restoring a hidden window asks KWin to focus it. The focus request can
+        // throw for a wrapper that is going away, and that must not turn a toggle
+        // that already happened into "failed to toggle window 1".
+        const dying = makeWindow('quake');
+        dying.minimized = true;
+        const other = makeWindow('other');
+        const { context } = load({
+            WindowName1: '^quake$',
+            windows: [dying, other],
+        });
+        Object.defineProperty(context.workspace, 'activeWindow', {
+            get() {
+                return this._activeWindow;
+            },
+            set: goingAway,
+        });
+
+        assert.doesNotThrow(() => harness.shortcuts[0].callback(),
+            'the failing activation does not escape into KWin');
+        assert.equal(dying.minimized, false, 'the toggle flags are still applied');
+        assert.equal(dying.onAllDesktops, false);
+        assert.equal(dying.skipTaskbar, false);
+        assert.equal(dying.skipPager, false);
+        assert.equal(dying.skipSwitcher, false);
+        const warnings = harness.warnings.join('\n');
+        assert.match(warnings, /could not activate a window matching slot 1/);
+        assert.doesNotMatch(warnings, /failed to toggle window 1/,
+            'a completed toggle is not reported as failed');
+    }, 'a window whose activation throws keeps the applied flags and reports no failure');
+
+    check(() => {
+        // The same failure must not abort the press: the slot still matches and a
+        // healthy window is toggled afterwards on the next press.
+        const dying = makeWindow('quake');
+        dying.minimized = true;
+        const { context } = load({ WindowName1: '^quake$', windows: [dying] });
+        Object.defineProperty(context.workspace, 'activeWindow', {
+            get() {
+                return this._activeWindow;
+            },
+            set: goingAway,
+        });
+        harness.shortcuts[0].callback();
+        assert.equal(dying.minimized, false, 'the flags were applied once');
+        harness.shortcuts[0].callback();
+        assert.equal(dying.minimized, true, 'the next press toggles back');
+    }, 'a failing activation does not break the following presses');
 }
 
 // ================================================== 9. the deadline replays a press
@@ -1413,12 +1550,12 @@ function assertGenerationIntact(context, before) {
 }
 
 // ===================================== 11. which windows are settings windows
-// The window classes the stale-configuration feature depends on, one test row
-// each: a rename upstream (or a regression in the suffix heuristic) has to show
-// up here instead of in the field. The trailing-version rows are the reason the
-// heuristic strips a version suffix before the suffix test, and the reverse-DNS
-// kcmshell row is the reason kcmshell is matched as a contained segment rather
-// than as a prefix.
+// The window names the stale-configuration feature depends on, one test row each:
+// a rename upstream (or a regression in the suffix heuristic) has to show up here
+// instead of in the field. The trailing-version rows are the reason the heuristic
+// strips a version suffix before the suffix test, and the reverse-DNS kcmshell row
+// is the reason kcmshell is matched as a contained segment rather than as a
+// prefix.
 const SETTINGS_CLASSES = [
     'systemsettings',
     'systemsettings6',
@@ -1442,6 +1579,18 @@ const LOOK_ALIKE_CLASSES = [
     'myapp',
 ];
 
+// Names that only desktopFileName can supply: a KCM embedded in System Settings
+// can carry a generic resource class and still report the settings host as its
+// desktop file. The last row also exercises the directory part, which KWin
+// documents for a desktop file outside the standard locations.
+const SETTINGS_DESKTOP_FILES = [
+    'org.kde.systemsettings.desktop',
+    'systemsettings.desktop',
+    'kdesystemsettings.desktop',
+    'plasma-systemsettings.desktop',
+    '/opt/settings/share/org.kde.systemsettings.desktop',
+];
+
 {
     for (const className of SETTINGS_CLASSES) {
         check(() => {
@@ -1459,12 +1608,73 @@ const LOOK_ALIKE_CLASSES = [
         }, 'the look-alike class ' + className + ' is not a settings window');
     }
 
+    // Each of the three sources has to be enough on its own. The old
+    // "first non-empty" rule hid the case this feature exists for: a resource
+    // class that says nothing while the desktop file name names the host.
+    for (const desktopFileName of SETTINGS_DESKTOP_FILES) {
+        check(() => {
+            const { context } = load({ windows: [] });
+            activate(context, makeWindow('Settings', {
+                resourceClass: 'generic-kcm',
+                resourceName: 'generic-kcm',
+                desktopFileName,
+            }));
+            assert.equal(context.settingsWindowSeen, true,
+                desktopFileName + ' is a settings window by its desktop file name');
+        }, 'the desktop file name ' + desktopFileName + ' is recognised');
+    }
+
     check(() => {
         const { context } = load({ windows: [] });
         activate(context, makeWindow('Settings', { resourceClass: '', resourceName: 'systemsettings' }));
         assert.equal(context.settingsWindowSeen, true,
-            'an empty resourceClass falls back to resourceName');
+            'resourceName identifies the dialog even with an empty resourceClass');
     }, 'resourceName is used when resourceClass is empty');
+
+    check(() => {
+        // resourceClass says nothing, but the resource name does: every source is
+        // checked, not only the first non-empty one.
+        const { context } = load({ windows: [] });
+        activate(context, makeWindow('Settings', {
+            resourceClass: 'generic-kcm',
+            resourceName: 'org.kde.systemsettings',
+        }));
+        assert.equal(context.settingsWindowSeen, true,
+            'a non-empty resourceClass does not hide a settings resourceName');
+    }, 'a non-empty resourceClass does not mask a settings resourceName');
+
+    check(() => {
+        // The negative row: a browser names itself in all three sources and must
+        // stay a normal window, otherwise every focus loss would reconfigure KWin.
+        const { context } = load({ windows: [] });
+        activate(context, makeWindow('Mozilla Firefox', {
+            resourceClass: 'Navigator',
+            resourceName: 'Navigator',
+            desktopFileName: 'firefox.desktop',
+        }));
+        assert.equal(context.settingsWindowSeen, false,
+            'firefox.desktop does not make Firefox a settings window');
+    }, 'a browser with firefox.desktop is not a settings window');
+
+    check(() => {
+        // Look-alike desktop file names stay unrecognised for the same reason the
+        // classes do, including the version and path forms.
+        for (const desktopFileName of [
+            'plasma-settings-helper.desktop',
+            'not-settings-really.desktop',
+            'kcm-helper.desktop',
+            'org.kde.plasma-systemmonitor.desktop',
+        ]) {
+            const { context } = load({ windows: [] });
+            activate(context, makeWindow('App', {
+                resourceClass: 'app',
+                resourceName: 'app',
+                desktopFileName,
+            }));
+            assert.equal(context.settingsWindowSeen, false,
+                desktopFileName + ' is not a settings window');
+        }
+    }, 'look-alike desktop file names are not settings windows');
 }
 
 // ========================================================= 12. desktop switch fixup

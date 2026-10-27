@@ -59,7 +59,9 @@ Press **Apply** or **OK**. Closing the Configure dialog only returns focus to Sy
 which is itself a settings window, so the script cannot treat that as "the dialog is gone":
 the new values are applied once System Settings itself loses focus, or on the next hotkey
 press. There is no need to disable and re-enable the script, and a hotkey pressed in between
-is not lost — it waits for the new values, normally about 200 ms and at most 1 s.
+is not lost — it waits for the new values, normally about 200 ms after KWin confirms the
+reconfigure. If KWin never confirms, the deferred press is replayed about 1 s after the most
+recent deferred press, so several quick presses can stretch the wait.
 
 If the change does not arrive (for instance after editing `kwinrc` by hand), toggle the
 script off and on again in *KWin Scripts*.
@@ -110,14 +112,21 @@ Known trade-offs:
 * Leaving System Settings triggers one KWin reconfigure even from an unrelated page, and so
   does closing `kcmshell6`: the script cannot tell which configuration module was open. That
   is the price of the generic module not notifying KWin after writing `kwinrc`.
-* Which windows count as settings windows is a name heuristic (the classes ending in
-  `settings` and the `kcmshell` modules). A third-party window whose class merely ends with
-  `settings` is treated as one too, which costs at most one deferred press and one extra
-  reconfigure.
-* If the system cannot create a `QTimer` at all, there is no deadline, so a press with a
-  possibly stale configuration is toggled synchronously instead of waiting forever. The
-  same fallback applies when the reconfigure request itself fails. That is reported once in
-  the journal.
+* Which windows count as settings windows is a name heuristic over the window class, the
+  resource name and the desktop file name (the names ending in `settings` and the `kcmshell`
+  modules). A third-party window whose name merely ends with `settings` is treated as one
+  too, which costs at most one deferred press and one extra reconfigure.
+* If no deadline can be armed — no `QTimer` can be created, or `start()` fails — a press
+  with a possibly stale configuration is toggled synchronously instead of waiting forever.
+  The same fallback applies when the reconfigure request itself fails. That is reported
+  once in the journal, and a reload request is never latched without a deadline to end it.
+
+### Reading the journal
+
+Everything the script reports goes to KWin's journal: `journalctl -f -u plasma-kwin_wayland`
+shows the `QuakeWindows:` lines live, and `QT_LOGGING_RULES="kwin_scripting.debug=true"`
+(exported before KWin starts) raises the scripting category to debug level when a warning is
+not enough.
 
 ### How a toggle changes window properties
 

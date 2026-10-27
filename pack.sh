@@ -23,6 +23,15 @@ for required in contents/config/main.xml contents/ui/config.ui contents/code/mai
     fi
 done
 
+# External commands the build calls. A missing one is reported the same way as a
+# missing input file, before anything is staged.
+for tool in zip; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "ERROR: $tool is not installed, refusing to build $package" >&2
+        exit 1
+    fi
+done
+
 staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT
 
@@ -65,7 +74,8 @@ if [ "$(catalog_checksum contents)" != "$(catalog_checksum "$staging/contents")"
     echo "         Commit contents/locale together with po/ before releasing." >&2
 fi
 
-rm -f "$package"
+# The archive is built in the staging tree and only then moved over the
+# previous one, so a failing zip leaves the last good archive in place.
 ( cd "$staging" && zip -qr "$package" contents/ LICENSE metadata.json )
 mv -f "$staging/$package" "$package"
 

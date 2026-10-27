@@ -73,6 +73,12 @@ var pendingPresses = [];
 // the timer can fail.
 var configTimer = null;
 
+// The deadline above is really ticking. Set only when start() returned, cleared
+// whenever it is stopped or fires, so it is the one truth about whether a wait
+// has an end. awaitingConfig is never left set without it: a latch whose deadline
+// could not be armed would swallow every later request.
+var configTimerArmed = false;
+
 // Toggling without waiting is worth exactly one journal line: a press that cannot
 // be deferred would otherwise repeat the warning on every keypress.
 var deferralFallbackLogged = false;
@@ -161,6 +167,23 @@ function setToggleFlags(client, hidden) {
     return true;
 }
 
+/**
+ * Asks KWin to focus a client. The assignment throws for a wrapper whose window
+ * is being destroyed, just like a property write, so it is guarded the same way:
+ * the flags of that window stay applied and only the focus request is skipped.
+ */
+function clientActivate(client) {
+    if (!client) {
+        return false;
+    }
+    try {
+        workspace.activeWindow = client;
+        return true;
+    } catch (error) {
+        return false;
+    }
+}
+
 function readString(key, fallback) {
     try {
         var value = readConfig(key, fallback);
@@ -230,7 +253,10 @@ function compilePattern(pattern, index) {
 /**
  * A compact signature of the stored slots: the enable flag and the pattern of
  * every slot, joined with NUL bytes, which neither of them can contain. Built by
- * hand so applyConfig() does not depend on a global another script could shadow.
+ * hand, without JSON or any other helper the engine provides: the comparison has
+ * to stay cheap (it runs on every reload), its result has to be deterministic,
+ * and it must not change if this file - or a future engine release - gives one of
+ * those helpers a different meaning.
  */
 function slotSignature(raw) {
     var parts = [];
@@ -274,42 +300,58 @@ function applyConfig() {
     info(summary);
 }
 
-function windowClass(client) {
-    if (!client) {
-        return "";
-    }
-    var name = clientText(client, "resourceClass");
-    if (!name) {
-        name = clientText(client, "resourceName");
-    }
-    return name.toLowerCase();
-}
-
 function endsWith(value, suffix) {
     return value.length >= suffix.length &&
         value.lastIndexOf(suffix) === value.length - suffix.length;
 }
 
 /**
- * Recognises the windows that host the settings dialog: systemsettings,
+ * Turns one window name into the bare module name: lower case, without the
+ * ".desktop" suffix of a desktop file name and without the directory part of an
+ * absolute path (desktopFileName may hold one when the file is not in a standard
+ * location). An empty name stays empty.
+ */
+function normalizeWindowName(value) {
+    var name = value.toLowerCase();
+    var slash = name.lastIndexOf("/");
+    if (slash !== -1) {
+        name = name.slice(slash + 1);
+    }
+    if (endsWith(name, ".desktop")) {
+        name = name.slice(0, name.length - ".desktop".length);
+    }
+    return name;
+}
+
+/**
+ * Every name KWin can identify a window by. All of them are considered instead of
+ * the first non-empty one, because the sources disagree: a KCM inside System
+ * Settings can carry a generic resource class while its desktop file name still
+ * names the settings host. Missing properties are simply empty strings.
+ */
+function windowNames(client) {
+    return [
+        normalizeWindowName(clientText(client, "resourceClass")),
+        normalizeWindowName(clientText(client, "resourceName")),
+        normalizeWindowName(clientText(client, "desktopFileName"))
+    ];
+}
+
+/**
+ * Matches one module name against the settings hosts: systemsettings,
  * plasma-systemsettings, plasma-settings, kdesystemsettings and reverse-DNS ids
- * like org.kde.systemsettings, plus every kcmshell module. The class and the
- * resource name end with the module name, so the suffix decides: a look-alike
- * such as "not-settings-really" or "plasma-settings-helper" is not a settings
- * window, while "org.kde.systemsettings" is.
+ * like org.kde.systemsettings, plus every kcmshell module. The name ends with the
+ * module name, so the suffix decides: a look-alike such as "not-settings-really"
+ * or "plasma-settings-helper" is not a settings window, while
+ * "org.kde.systemsettings" is.
  *
  * A trailing version number is not part of the name, so "systemsettings6" is
  * recognised exactly like the unversioned form. kcmshell is matched as a
  * contained segment rather than as a prefix, because the portal and standalone
  * forms are reverse-DNS ids such as org.kde.kcmshell6.
- *
- * Known trade-off, kept on purpose: a third-party window class that merely ends
- * with "settings" also counts as a settings window. Missing the real dialog costs
- * a stale toggle, while a false positive only costs one deferred press and one
- * reconfigure.
  */
-function isSettingsWindow(client) {
-    var name = windowClass(client).replace(/[0-9]+$/, "");
+function isSettingsName(name) {
+    name = name.replace(/[0-9]+$/, "");
     if (!name) {
         return false;
     }
@@ -317,6 +359,25 @@ function isSettingsWindow(client) {
         return true;
     }
     return endsWith(name, "settings");
+}
+
+/**
+ * True when any name of the window identifies it as a host of the settings
+ * dialog.
+ *
+ * Known trade-off, kept on purpose: a third-party window whose name merely ends
+ * with "settings" also counts as a settings window. Missing the real dialog costs
+ * a stale toggle, while a false positive only costs one deferred press and one
+ * reconfigure.
+ */
+function isSettingsWindow(client) {
+    var names = windowNames(client);
+    for (var index = 0; index < names.length; ++index) {
+        if (isSettingsName(names[index])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -359,22 +420,36 @@ function configMayBeStale() {
  * 200 ms timer, so there is no point in debouncing here; the shared deadline is
  * only about the answer, not about the request.
  *
- * Returns true when a deferred press may wait: a reload is pending and something
- * will end the wait, either the answer or the deadline. Returns false when
- * waiting would strand the press - the call threw, or no QTimer can be created
- * here - so the caller has to toggle synchronously instead.
+ * Returns true when a deferred press may wait: a reload is pending and the shared
+ * deadline is really ticking, so something will end the wait even if the answer
+ * never arrives. Returns false when waiting would strand the press - the deadline
+ * could not be armed (no QTimer here, or start() threw) or the call itself threw
+ * - so the caller has to toggle synchronously instead. Everything is decided by
+ * configTimerArmed, never by "is there a timer object?": a created but unarmed
+ * timer ends nothing.
  */
 function requestConfigReload() {
     if (awaitingConfig) {
-        // A request is already in flight: the press waits for the same answer and
-        // shares the same deadline, which exists unless no timer could be made.
-        return configDeadline() !== null;
+        if (configTimerArmed) {
+            // A request is already in flight: the press waits for the same answer
+            // and shares the same deadline.
+            return true;
+        }
+        // The latch has no deadline left to end it, so it would swallow every
+        // later request. Drop it and send a fresh one below instead.
+        awaitingConfig = false;
     }
     awaitingConfig = true;
     armConfigTimer();
+    if (!configTimerArmed) {
+        // The request is still worth sending - options.configChanged may arrive -
+        // but nothing here can end the wait, so no latch is kept.
+        awaitingConfig = false;
+    }
     // The try/catch only guards the JS call itself: Script::callDBus() never
     // throws and silently drops error replies, so a failed reconfigure is
-    // invisible here. The deadline armed above is what unsticks it.
+    // invisible here. The deadline armed above is what unsticks it, when one
+    // could be armed at all.
     try {
         callDBus("org.kde.KWin", "/KWin", "org.kde.KWin", "reconfigure");
     } catch (error) {
@@ -385,9 +460,9 @@ function requestConfigReload() {
         // wait for.
         return false;
     }
-    // The request survived, but waiting still needs a deadline: without a timer
-    // only options.configChanged could end the wait, and it may never come.
-    return configDeadline() !== null;
+    // The request survived, but waiting still needs a deadline: without one only
+    // options.configChanged could end the wait, and it may never come.
+    return configTimerArmed;
 }
 
 /**
@@ -434,12 +509,17 @@ function armConfigTimer() {
     }
     try {
         timer.start(CONFIG_TIMEOUT_MS);
+        // Only a start() that returned makes the deadline real. A throwing one
+        // leaves the timer in an unknown state, which is treated as not armed.
+        configTimerArmed = true;
     } catch (error) {
+        configTimerArmed = false;
         warn("could not start the configuration timer: " + error);
     }
 }
 
 function stopConfigTimer() {
+    configTimerArmed = false;
     if (!configTimer) {
         return;
     }
@@ -569,6 +649,8 @@ function rereadConfigAndReplay() {
  * warning is the one report of the stuck reload; nothing else logs about it.
  */
 function onConfigTimeout() {
+    // The single-shot timer stopped itself before this handler ran.
+    configTimerArmed = false;
     if (awaitingConfig) {
         awaitingConfig = false;
         warn("KWin did not confirm the configuration reload, using the current values");
@@ -629,10 +711,11 @@ function toggleWindow(index, configIsFresh) {
         if (requestConfigReload()) {
             return;
         }
-        // The request failed or got no deadline, so waiting would mean waiting
-        // forever. A toggle with a possibly stale configuration beats a press
-        // that never happens: undo the parity flip just made, say so once and
-        // fall through to the synchronous path.
+        // The request could not be given a deadline (it threw, or no timer could
+        // be created or started), so waiting would mean waiting forever. A toggle
+        // with a possibly stale configuration beats a press that never happens:
+        // undo the parity flip just made, say so once and fall through to the
+        // synchronous path.
         clearPendingPress(index);
         if (!deferralFallbackLogged) {
             deferralFallbackLogged = true;
@@ -667,8 +750,10 @@ function toggleWindow(index, configIsFresh) {
             warn("could not set the toggle flags of a window matching slot " + (index + 1));
             break;
         }
-        if (prevMini) {
-            workspace.activeWindow = client;
+        if (prevMini && !clientActivate(client)) {
+            // The window is going away: it has been toggled, it just cannot be
+            // focused. The press itself is done.
+            warn("could not activate a window matching slot " + (index + 1));
         }
         break; // only toggle one window
     }
