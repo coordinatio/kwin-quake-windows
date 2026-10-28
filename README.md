@@ -252,6 +252,20 @@ QUAKEWINDOWS_TEST_REQUIRE=1 ./tests/run-script-engine-test.sh
 With the variable set, a missing dependency is reported as `FAIL` with exit status 1. The
 JavaScript, UI and locale suites have no optional parts and do not look at it.
 
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `main`, on every pull request and on
+demand, in two jobs:
+
+* **suites** - the dependency-free checks (`main-js-test.mjs`, `ui-test.py` without PyQt6,
+  `locale-test.py`) and `./pack.sh`. It fails if `pack.sh` warns (a drifted or stale catalog),
+  if building modifies a tracked file, or if the archive is missing a file the package needs
+  or carries a developer-only entry such as `tests/` or `po/`.
+* **kwin** - the optional checks against a real Qt6/KF6/KWin stack in an Arch container: the
+  PyQt6 widget part of `ui-test.py`, `run-script-engine-test.sh` and `run-kcm-test.sh` with
+  both `C.UTF-8` and `ru_RU.UTF-8`. `QUAKEWINDOWS_TEST_REQUIRE=1` is set, so a missing
+  dependency or an absent locale fails the job instead of quietly shrinking the coverage.
+
 ## Credits
 
 The script is inspired by [kwin-toggle-window](https://www.opencode.net/arnek01/kwin-toggle-window) by Arne Keller.

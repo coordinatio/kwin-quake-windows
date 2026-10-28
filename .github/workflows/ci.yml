@@ -1,0 +1,198 @@
+# Continuous integration for the Quake Windows KWin script.
+#
+# Two jobs, split by dependency weight:
+#
+#   suites  the dependency-free suites (plain Node, Python standard library) and
+#           pack.sh. Nothing is compiled and nothing is installed beyond gettext
+#           and zip, so this job is cheap and finishes in about a minute.
+#
+#   kwin    the optional checks that need a real Qt6/KF6/KWin stack: the settings
+#           KCM round trip (including the translated form), the script engine
+#           check and the PyQt6 widget part of the UI suite. It runs in an Arch
+#           container, i.e. the distribution the runners themselves point at, so
+#           the packages needed are the ones their SKIP messages name.
+#           QUAKEWINDOWS_TEST_REQUIRE=1 turns any "cannot run here" skip into a
+#           failure: the job must not go green while coverage silently vanishes.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to the same branch makes the previous run pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Container jobs default to `sh`; every step here relies on bash (arrays,
+# herestrings, pipefail), so ask for it explicitly.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  suites:
+    name: Suites and package (no dependencies)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the packaging tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # msgfmt keeps pack.sh on its "rebuild the catalogs from po/" path
+          # instead of the warning fallback; zip archives, unzip verifies.
+          sudo apt-get install -y --no-install-recommends gettext zip unzip
+
+      - name: Logic tests of contents/code/main.js against mocked KWin globals
+        run: node tests/main-js-test.mjs
+
+      - name: Structure of config/main.xml and config.ui (standard library)
+        run: python3 tests/ui-test.py
+
+      - name: Committed catalogs match po/ and metadata.json
+        run: python3 tests/locale-test.py
+
+      - name: Build quakewindows.kwinscript
+        run: |
+          set -euo pipefail
+
+          # pack.sh reports a missing component as an error (non-zero) and a
+          # drifted or missing locale catalog as a warning. Both mean the package
+          # is not releasable, so the warning becomes a failure here.
+          output="$(./pack.sh 2>&1)"
+          printf '%s\n' "$output"
+          if grep -q '^WARNING' <<<"$output"; then
+              echo "::error::pack.sh warned; the package would ship stale catalogs"
+              exit 1
+          fi
+
+          # Building stages everything in a temporary directory and only writes
+          # the ignored archive, so no tracked file may change.
+          if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+              echo "::error::pack.sh modified tracked files:"
+              git status --porcelain --untracked-files=no
+              exit 1
+          fi
+
+          # The archive is the only install vehicle that keeps tests/ and po/ out
+          # of an installation, so every file the package needs must be in it.
+          members="$(unzip -Z1 quakewindows.kwinscript)"
+          missing=()
+          for required in \
+              contents/code/main.js \
+              contents/config/main.xml \
+              contents/ui/config.ui \
+              contents/locale/ru/LC_MESSAGES/quakewindows.mo \
+              LICENSE \
+              metadata.json; do
+              grep -qxF "$required" <<<"$members" || missing+=("$required")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+              echo "::error::the archive is missing: ${missing[*]}"
+              exit 1
+          fi
+
+          # ...and nothing developer-only may leak into an installation: the
+          # archive is the only install vehicle that keeps tests/, po/ and the
+          # build scripts out of the package root.
+          leaked="$(awk -F/ '{print $1}' <<<"$members" | sed 's:/$::' |
+                    sort -u | grep -vxE 'contents|LICENSE|metadata\.json' || true)"
+          if [ -n "$leaked" ]; then
+              echo "::error::the archive carries entries outside the package:"
+              while IFS= read -r entry; do
+                  echo "  $entry"
+              done <<<"$leaked"
+              exit 1
+          fi
+
+  kwin:
+    name: Qt/KWin integration checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container: archlinux:base-devel
+    env:
+      # The optional suites skip with exit status 0 when a dependency is absent;
+      # in CI that must fail instead.
+      QUAKEWINDOWS_TEST_REQUIRE: "1"
+
+    steps:
+      - name: Install Qt6, KF6, KWin and the test tooling
+        run: |
+          set -euo pipefail
+
+          # The runtime bind-mounts /etc/resolv.conf, /etc/hosts and /etc/hostname,
+          # so the filesystem package upgrade can refuse to overwrite them.
+          pacman -Syu --noconfirm ||
+              pacman -Syu --noconfirm --overwrite '/etc/resolv.conf,/etc/hosts,/etc/hostname'
+
+          pacman -S --noconfirm --needed \
+              git gettext zip unzip python python-pyqt6 \
+              qt6-base qt6-declarative \
+              kcmutils kconfig kconfigwidgets kcoreaddons kwidgetsaddons \
+              kpackage kwin
+
+      - uses: actions/checkout@v4
+
+      - name: Generate the ru_RU.UTF-8 locale
+        run: |
+          set -euo pipefail
+          # The KCM check runs a second time under ru_RU.UTF-8 and silently
+          # skips that run when the locale is absent. Generating it here keeps
+          # the translated form of the form in the job.
+          sed -i -E 's/^# *ru_RU\.UTF-8 UTF-8/ru_RU.UTF-8 UTF-8/' /etc/locale.gen
+          grep -qx 'ru_RU.UTF-8 UTF-8' /etc/locale.gen
+          locale-gen
+          # Read the list fully: `locale -a | grep -q` would let grep exit early
+          # and SIGPIPE locale under `set -o pipefail`.
+          available="$(locale -a)"
+          grep -qi '^ru_RU' <<<"$available"
+
+      - name: Print the toolchain versions
+        run: |
+          set -euo pipefail
+          # A readable record in the log when one of the optional suites starts
+          # skipping, instead of having to reconstruct the image.
+          g++ --version | sed -n 1p
+          pkg-config --modversion Qt6Core Qt6Qml
+          printf 'qmake6 Qt %s\n' "$(qmake6 -query QT_VERSION)"
+          python3 --version
+          printf 'kpackagetool6: %s\n' "$(command -v kpackagetool6)"
+          printf 'scripted KCM plugin: %s\n' \
+              "$(qmake6 -query QT_INSTALL_PLUGINS)/kwin/effects/configs/kcm_kwin4_genericscripted.so"
+
+      - name: Instantiated settings form widgets (PyQt6, offscreen)
+        run: |
+          set -euo pipefail
+          # The widget part of this suite is optional and exits 0 after printing
+          # SKIP; PyQt6 is installed above, so a skip means the coverage is gone.
+          python3 tests/ui-test.py 2>&1 | tee /tmp/ui.log
+          if grep -q '^SKIP:' /tmp/ui.log; then
+              echo "::error::the UI suite skipped its PyQt6 widget checks although PyQt6 is installed"
+              exit 1
+          fi
+
+      - name: contents/code/main.js in a real Qt script engine
+        run: ./tests/run-script-engine-test.sh
+
+      - name: Settings dialog round trip (English and Russian)
+        run: |
+          set -euo pipefail
+          ./tests/run-kcm-test.sh 2>&1 | tee /tmp/kcm.log
+          # The Russian run is the only check of the translated form; require it
+          # rather than letting a missing locale reduce the job to one language.
+          if ! grep -q 'running the KCM test with LANG=ru_RU.UTF-8' /tmp/kcm.log; then
+              echo "::error::the KCM check skipped its ru_RU.UTF-8 run"
+              exit 1
+          fi
