@@ -14,7 +14,7 @@
         "License": "GPL-3.0-or-later",
         "Name": "Quake Windows",
         "Name[ru]": "Quake-окна",
-        "Version": "2.2",
+        "Version": "2.2.1",
         "EnabledByDefault": true
     },
     "X-Plasma-API": "javascript",

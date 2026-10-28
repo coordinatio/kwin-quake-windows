@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 msgid ""
 msgstr ""
-"Project-Id-Version: quakewindows 2.2\n"
+"Project-Id-Version: quakewindows 2.2.1\n"
 "Report-Msgid-Bugs-To: angrycore@gmail.com\n"
 "PO-Revision-Date: 2026-10-27 12:00+0000\n"
 "Last-Translator: Ivan Volkov <angrycore@gmail.com>\n"
