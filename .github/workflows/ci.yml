@@ -151,8 +151,21 @@ jobs:
           # The KCM check runs a second time under ru_RU.UTF-8 and silently
           # skips that run when the locale is absent. Generating it here keeps
           # the translated form of the form in the job.
-          sed -i -E 's/^# *ru_RU\.UTF-8 UTF-8/ru_RU.UTF-8 UTF-8/' /etc/locale.gen
-          grep -qx 'ru_RU.UTF-8 UTF-8' /etc/locale.gen
+          #
+          # The image is built with aggressive NoExtract rules in /etc/pacman.conf:
+          # they keep the locale definitions in /usr/share/i18n/locales out of the
+          # filesystem to shrink it, so locale-gen has nothing to compile. Drop the
+          # rules and reinstall glibc to get the definitions back; both only matter
+          # for a throw-away container.
+          if [ ! -f /usr/share/i18n/locales/ru_RU ]; then
+              sed -i '/^NoExtract/d' /etc/pacman.conf
+              pacman -S --noconfirm glibc >/dev/null
+          fi
+          # The shipped /etc/locale.gen has the entry commented out and padded with
+          # trailing spaces, so appending an exact line beats uncommenting it.
+          if ! grep -qx 'ru_RU.UTF-8 UTF-8' /etc/locale.gen; then
+              echo 'ru_RU.UTF-8 UTF-8' >> /etc/locale.gen
+          fi
           locale-gen
           # Read the list fully: `locale -a | grep -q` would let grep exit early
           # and SIGPIPE locale under `set -o pipefail`.
