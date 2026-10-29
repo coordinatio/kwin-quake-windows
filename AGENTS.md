@@ -15,6 +15,7 @@ contents/
   ui/config.ui        # settings dialog form (7 slots: checkbox + regex field)
   locale/ru/…         # compiled translations (.mo) — committed, built from po/
 metadata.json         # KPackage metadata (id: quakewindows, version, translations)
+assets/logo.png       # project logo shown in the README
 po/                   # translation sources (.pot template + ru.po)
 tests/                # test suites (see below)
 tools/                # update-po.sh, build-locale.sh (translation workflow)

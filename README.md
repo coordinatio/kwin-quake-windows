@@ -1,5 +1,9 @@
 # Quake Windows
 
+<p align="center">
+  <img src="assets/logo.png" alt="Quake Windows logo" width="640">
+</p>
+
 A KWin script that makes any window behave like a quake-style drop-down terminal:
 press a hotkey and the window slides in; press it again and the window hides.
 
